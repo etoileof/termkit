@@ -1,1 +1,9 @@
-*.tar.gz binary
+# Patches must stay byte-exact for git am.
+*.patch -text
+
+# Windows scripts run on Windows only.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.txt text eol=crlf
+
+*.sh text eol=lf

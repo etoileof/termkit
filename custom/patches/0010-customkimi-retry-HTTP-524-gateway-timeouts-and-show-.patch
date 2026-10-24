@@ -1,0 +1,434 @@
+From 3ff9b7167cb4c34e58612c0e6df0d86173603256 Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Fri, 23 Oct 2026 08:07:20 +0200
+Subject: [PATCH 10/13] customkimi: retry HTTP 524 gateway timeouts and show
+ retry notices
+
+---
+ .changeset/retry-provider-gateway-timeout.md  |  5 ++
+ .../tui/components/messages/status-message.ts |  2 +-
+ .../tui/controllers/session-event-handler.ts  | 11 ++++
+ apps/kimi-code/src/tui/kimi-tui.ts            |  4 +-
+ apps/kimi-code/src/tui/types.ts               |  1 +
+ .../session-event-handler-step-retry.test.ts  | 16 +++++
+ .../test/tui/kimi-tui-message-flow.test.ts    | 35 +++++++++++
+ .../src/human/llm/requester/retry.ts          |  4 +-
+ .../src/human/test/agent/turn.test.ts         | 37 +++++++++--
+ .../src/llm-adapter/contract/errors.ts        |  2 +-
+ .../test/app/llmProtocol/errors.test.ts       |  2 +-
+ .../src/services/transcript/coreEventMap.ts   | 15 ++++-
+ .../test/services/transcript.test.ts          | 26 ++++++++
+ .../test/session-prompt-events.test.ts        | 62 +++++++++++++++++++
+ 14 files changed, 211 insertions(+), 11 deletions(-)
+ create mode 100644 .changeset/retry-provider-gateway-timeout.md
+
+diff --git a/.changeset/retry-provider-gateway-timeout.md b/.changeset/retry-provider-gateway-timeout.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..51cf254fce0ae35a27a29f7ecfc6d5fb40118d5c
+--- /dev/null
++++ b/.changeset/retry-provider-gateway-timeout.md
+@@ -0,0 +1,5 @@
++---
++"@moonshot-ai/kimi-code": patch
++---
++
++Retry transient HTTP 524 provider errors and show automatic turn retry notices in terminal and web chats.
+diff --git a/apps/kimi-code/src/tui/components/messages/status-message.ts b/apps/kimi-code/src/tui/components/messages/status-message.ts
+index 5a0523f58f0ee14fd427d4606a2d84a98ac5b07a..c7490d4f5a2cc7bcfc3915ca74445d2d66784702 100644
+--- a/apps/kimi-code/src/tui/components/messages/status-message.ts
++++ b/apps/kimi-code/src/tui/components/messages/status-message.ts
+@@ -8,7 +8,7 @@ export class StatusMessageComponent extends Container {
+   private content: string;
+   private color?: ColorToken;
+ 
+-  constructor(content: string, color?: ColorToken) {
++  constructor(content: string, color?: ColorToken, readonly preserveWhenFolding = false) {
+     super();
+     this.content = content;
+     this.color = color;
+diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+index 55790856f58f7c2090d7e62028b33a6a6fdb9ae2..38420e19de570768421360057903dc46441e1e02 100644
+--- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
++++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+@@ -478,6 +478,17 @@ export class SessionEventHandler {
+   }
+ 
+   private handleStepRetrying(event: TurnStepRetryingEvent): void {
++    this.host.streamingUI.flushNow();
++    const status = event.statusCode === undefined ? '' : ` (HTTP ${event.statusCode})`;
++    const seconds = Math.max(1, Math.ceil(event.delayMs / 1000));
++    this.host.appendTranscriptEntry({
++      id: nextTranscriptId(),
++      kind: 'status',
++      turnId: String(event.turnId),
++      renderMode: 'plain',
++      preserveWhenFolding: true,
++      content: `System notice: Model request failed${status}. Retrying attempt ${event.nextAttempt}/${event.maxAttempts} in ${seconds}s.`,
++    });
+     // The failure may arrive mid-stream, after thinking/assistant deltas have
+     // parked the pane in `thinking`/`composing` — drive it back to waiting so
+     // the retry label and detail actually render during the backoff.
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index f391d6ba71d3837cba349adecee965238f3c78b1..9237e88eae53bdeda07c8d9c94bc697f2aa118e2 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -3451,7 +3451,7 @@ export class KimiTUI {
+         }
+         return entry.renderMode === 'notice'
+           ? new NoticeMessageComponent(entry.content, entry.detail)
+-          : new StatusMessageComponent(entry.content, entry.color);
++          : new StatusMessageComponent(entry.content, entry.color, entry.preserveWhenFolding);
+       case 'welcome':
+         return null;
+       default:
+@@ -3747,6 +3747,7 @@ export class KimiTUI {
+         assistantIndices.push(i);
+         continue;
+       }
++      if (child instanceof StatusMessageComponent && child.preserveWhenFolding) continue;
+       stepIndices.push(i);
+     }
+ 
+@@ -3826,6 +3827,7 @@ export class KimiTUI {
+       const assistantIndices: number[] = [];
+       for (let i = turnStart + 1; i < turnEnd; i++) {
+         const child = children[i]!;
++        if (child instanceof StatusMessageComponent && child.preserveWhenFolding) continue;
+         if (child instanceof StepSummaryComponent) summaryIndex = i;
+         else if (child instanceof AssistantMessageComponent) assistantIndices.push(i);
+         else stepIndices.push(i);
+diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
+index 49286596c5edaa5ed0b180ff57b8c288d8af7625..a85097f263cfce2e543c7e78d62fab129cee939b 100644
+--- a/apps/kimi-code/src/tui/types.ts
++++ b/apps/kimi-code/src/tui/types.ts
+@@ -245,6 +245,7 @@ export interface TranscriptEntry {
+   turnId?: string;
+   renderMode: 'markdown' | 'plain' | 'notice';
+   content: string;
++  preserveWhenFolding?: boolean;
+   /**
+    * True only for entries holding real model-authored text (created by the
+    * assistant stream). Derived cards — hook results, goal completions, goal
+diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-step-retry.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-step-retry.test.ts
+index c4e292bb55841d51d23849addb1c6478ff5a80d6..7423ad54b84a5e20ca9e416fea4605fd509626ec 100644
+--- a/apps/kimi-code/test/tui/controllers/session-event-handler-step-retry.test.ts
++++ b/apps/kimi-code/test/tui/controllers/session-event-handler-step-retry.test.ts
+@@ -90,6 +90,22 @@ describe('SessionEventHandler step retry state', () => {
+     vi.useRealTimers();
+   });
+ 
++  it.each([524, undefined])('prints a lasting retry notice for status %s', (statusCode) => {
++    const { host } = makeHost();
++    const handler = new SessionEventHandler(host);
++    handler.handleEvent({ ...retryingEvent, statusCode } as any, vi.fn());
++    handler.handleEvent({ type: 'turn.step.completed', sessionId: 's1', agentId: 'main', turnId: 1, step: 1 } as any, vi.fn());
++
++    const error = statusCode === undefined ? '' : ' (HTTP 524)';
++    expect(host.appendTranscriptEntry).toHaveBeenCalledWith(expect.objectContaining({
++      kind: 'status',
++      turnId: '1',
++      renderMode: 'plain',
++      content: `System notice: Model request failed${error}. Retrying attempt 2/10 in 4s.`,
++    }));
++    expect(host.state.appState.stepRetry).toBeNull();
++  });
++
+   it('stores the retry snapshot when a step starts retrying', () => {
+     const { host } = makeHost();
+     const handler = new SessionEventHandler(host);
+diff --git a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
+index dfa1ab26203a2dcbda0de2f156f6f260839fedbf..c7cb6506bca3275ccb7249ad131315a116da1955 100644
+--- a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
++++ b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
+@@ -11707,6 +11707,41 @@ describe('transcript step and assistant folding', () => {
+     }
+   }
+ 
++  it('keeps retry notices visible when long turns are folded', async () => {
++    const { driver } = await makeDriver();
++    driver.handleUserInput('retry and continue');
++    driver.sessionEventHandler.handleEvent({
++      type: 'turn.step.retrying', agentId: 'main', sessionId: 'ses-1', turnId: 1, step: 1,
++      failedAttempt: 1, nextAttempt: 2, maxAttempts: 10, delayMs: 500,
++      errorName: 'APIStatusError', errorMessage: 'timeout', statusCode: 524,
++    } as Event, vi.fn());
++    driveSteps(driver, TRANSCRIPT_KEEP_RECENT_STEPS + 7);
++    expect(stripSgr(renderTranscript(driver))).toContain('System notice: Model request failed (HTTP 524).');
++    driver.sessionEventHandler.handleEvent({
++      type: 'turn.ended', agentId: 'main', sessionId: 'ses-1', turnId: 1, reason: 'completed',
++    } as Event, vi.fn());
++    expect(stripSgr(renderTranscript(driver))).toContain('Retrying attempt 2/10 in 1s.');
++    (driver as unknown as { mergeAllTurnSteps(): void }).mergeAllTurnSteps();
++    expect(stripSgr(renderTranscript(driver))).toContain('Retrying attempt 2/10 in 1s.');
++  });
++
++  it('renders buffered thinking before its retry notice', async () => {
++    const { driver } = await makeDriver();
++    driver.handleUserInput('retry with pending thinking');
++    driver.sessionEventHandler.handleEvent({
++      type: 'thinking.delta', agentId: 'main', sessionId: 'ses-1', turnId: 1, delta: 'Thought before failure',
++    } as Event, vi.fn());
++    driver.sessionEventHandler.handleEvent({
++      type: 'turn.step.retrying', agentId: 'main', sessionId: 'ses-1', turnId: 1, step: 1,
++      failedAttempt: 1, nextAttempt: 2, maxAttempts: 10, delayMs: 500,
++      errorName: 'APIStatusError', errorMessage: 'timeout', statusCode: 524,
++    } as Event, vi.fn());
++    driver.streamingUI.flushNow();
++    const text = stripSgr(renderTranscript(driver));
++    expect(text).toContain('Thought before failure');
++    expect(text.indexOf('Thought before failure')).toBeLessThan(text.indexOf('System notice:'));
++  });
++
+   it('folds the oldest assistant messages and steps beyond their per-turn caps', async () => {
+     const { driver } = await makeDriver();
+     driver.handleUserInput('fold me');
+diff --git a/packages/agent-core-v2/src/human/llm/requester/retry.ts b/packages/agent-core-v2/src/human/llm/requester/retry.ts
+index f7e035f91fdd802056b98513f1d3373951ec98fe..11d92e73956558499eabd243f975b64d18aaa536 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/retry.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/retry.ts
+@@ -7,7 +7,7 @@ const MAX_DELAY_MS = 32_000;
+ const RETRY_FACTOR = 2;
+ const JITTER_FACTOR = 0.25;
+ 
+-const RETRYABLE_STATUS_CODES: readonly number[] = [408, 409, 429, 500, 502, 503, 504, 529];
++const RETRYABLE_STATUS_CODES: ReadonlySet<number> = new Set([408, 409, 429, 500, 502, 503, 504, 524, 529]);
+ 
+ export interface LlmRetryOptions {
+   readonly maxAttemptsPerStep?: number;
+@@ -50,7 +50,7 @@ export function isRetryableError(error: LlmErrorMessage): boolean {
+     case 'empty_response':
+       return error.finishReason !== 'filtered';
+     case 'status':
+-      return RETRYABLE_STATUS_CODES.includes(error.statusCode);
++      return RETRYABLE_STATUS_CODES.has(error.statusCode);
+     default:
+       return true;
+   }
+diff --git a/packages/agent-core-v2/src/human/test/agent/turn.test.ts b/packages/agent-core-v2/src/human/test/agent/turn.test.ts
+index 8cae5fb663dbf6bddc5049609131479ec2f6e77b..e90ba791e1abd1051d8ec4e66ea7edf9739d8f59 100644
+--- a/packages/agent-core-v2/src/human/test/agent/turn.test.ts
++++ b/packages/agent-core-v2/src/human/test/agent/turn.test.ts
+@@ -101,6 +101,7 @@ function startTurnActor(
+     states: {
+       running: {
+         invoke: {
++          id: 'turn',
+           src: 'turn',
+           input: ({ context }) => context.turnInput,
+           onDone: {
+@@ -263,11 +264,39 @@ describe('turn machine llm retry', () => {
+     expect(failed).toHaveLength(0);
+   });
+ 
+-  it('fails after maxAttemptsPerStep is exhausted', async () => {
++  it('retries HTTP 524 errors and succeeds', async () => {
++    const { requester, calls } = createStubRequester([statusError(524, 'gateway timeout'), 'ok']);
++    const { actor, retrying } = startTurnActor(requester, { retry: { maxAttemptsPerStep: 3 } });
++
++    await flush();
++    expect(retrying).toHaveLength(1);
++    expect(retrying[0]).toMatchObject({ statusCode: 524, failedAttempt: 1, nextAttempt: 2 });
++
++    await vi.advanceTimersByTimeAsync((retrying[0] as RetryingEvent).delayMs + 1);
++    await flush();
++
++    expect(actor.getSnapshot().context.turnOutput).toMatchObject({ type: 'done' });
++    expect(calls()).toBe(2);
++  });
++
++  it('cancels HTTP 524 retry backoff without another request', async () => {
++    const { requester, calls } = createStubRequester([statusError(524, 'gateway timeout'), 'ok']);
++    const { actor, retrying } = startTurnActor(requester);
++
++    await flush();
++    expect(retrying).toHaveLength(1);
++    actor.getSnapshot().children.turn?.send({ type: 'turn.abort' });
++    await vi.advanceTimersByTimeAsync(60_000);
++
++    expect(actor.getSnapshot().context.turnOutput).toMatchObject({ type: 'aborted' });
++    expect(calls()).toBe(1);
++  });
++
++  it.each([503, 524])('fails HTTP %i after maxAttemptsPerStep is exhausted', async (statusCode) => {
+     const { requester, calls } = createStubRequester([
+-      statusError(503, 'unavailable'),
+-      statusError(503, 'unavailable'),
+-      statusError(503, 'unavailable'),
++      statusError(statusCode, 'unavailable'),
++      statusError(statusCode, 'unavailable'),
++      statusError(statusCode, 'unavailable'),
+     ]);
+     const { actor, retrying, failed } = startTurnActor(requester, {
+       retry: { maxAttemptsPerStep: 3 },
+diff --git a/packages/agent-core-v2/src/llm-adapter/contract/errors.ts b/packages/agent-core-v2/src/llm-adapter/contract/errors.ts
+index 97fbc411611d49b2175ee1b029d2a10fefde85f0..00fe6aec33407719a4e1a9f5e6f59847adeb2be2 100644
+--- a/packages/agent-core-v2/src/llm-adapter/contract/errors.ts
++++ b/packages/agent-core-v2/src/llm-adapter/contract/errors.ts
+@@ -239,7 +239,7 @@ export function isRetryableGenerateError(error: unknown): boolean {
+     if (error instanceof APIProviderQuotaExhaustedError) {
+       return false;
+     }
+-    return [408, 409, 429, 500, 502, 503, 504, 529].includes(error.statusCode);
++    return [408, 409, 429, 500, 502, 503, 504, 524, 529].includes(error.statusCode);
+   }
+   return error instanceof ChatProviderError && !isImageFormatError(error);
+ }
+diff --git a/packages/agent-core-v2/test/app/llmProtocol/errors.test.ts b/packages/agent-core-v2/test/app/llmProtocol/errors.test.ts
+index 4c765b0c5e4e2ccf98421ff3791a77631007eadf..65a54f3ba6d9a221eb7a9ad0eb768150ecccb36c 100644
+--- a/packages/agent-core-v2/test/app/llmProtocol/errors.test.ts
++++ b/packages/agent-core-v2/test/app/llmProtocol/errors.test.ts
+@@ -161,7 +161,7 @@ describe('isRetryableGenerateError', () => {
+     expect(isRetryableGenerateError(new APIEmptyResponseError('empty'))).toBe(true);
+   });
+ 
+-  it.each([408, 409, 429, 500, 502, 503, 504, 529])(
++  it.each([408, 409, 429, 500, 502, 503, 504, 524, 529])(
+     'treats HTTP %i as retryable',
+     (statusCode) => {
+       expect(isRetryableGenerateError(new APIStatusError(statusCode, 'retryable'))).toBe(true);
+diff --git a/packages/kap-server/src/services/transcript/coreEventMap.ts b/packages/kap-server/src/services/transcript/coreEventMap.ts
+index 85cc8e30730f6f4c20db86f140a80fba00d933f3..3e971b3945275e17de0541ea760b8b03b2b563f6 100644
+--- a/packages/kap-server/src/services/transcript/coreEventMap.ts
++++ b/packages/kap-server/src/services/transcript/coreEventMap.ts
+@@ -787,6 +787,19 @@ export class AgentTranscriptProjector {
+       },
+     };
+     ops.push({ op: 'step.upsert', turnId, step: this.currentStep });
++    const status = event.statusCode === undefined ? '' : ` (HTTP ${event.statusCode})`;
++    const seconds = Math.max(1, Math.ceil(event.delayMs / 1000));
++    ops.push({
++      op: 'frame.upsert',
++      turnId,
++      stepId,
++      frame: {
++        kind: 'text',
++        frameId: `${stepId}.retry-${event.nextAttempt}`,
++        role: 'assistant',
++        text: `System notice: Model request failed${status}. Retrying attempt ${event.nextAttempt}/${event.maxAttempts} in ${seconds}s.`,
++      },
++    });
+     return ops;
+   }
+ 
+@@ -841,7 +854,7 @@ export class AgentTranscriptProjector {
+     }
+     for (let i = frames.length - 1; i >= 0; i -= 1) {
+       const frame = frames[i];
+-      if (frame === undefined) continue;
++      if (frame === undefined || frame.frameId.startsWith(`${stepId}.retry-`)) continue;
+       if (kind === 'assistant' && frame.kind === 'text' && frame.role === 'assistant') {
+         return { frameId: frame.frameId, offset: frame.text.length, text: frame.text };
+       }
+diff --git a/packages/kap-server/test/services/transcript.test.ts b/packages/kap-server/test/services/transcript.test.ts
+index 1b27a3d8db277131ee10667e251b60587957aed4..95e0846e4fb0108be6d371812a781a54cbf4a5b8 100644
+--- a/packages/kap-server/test/services/transcript.test.ts
++++ b/packages/kap-server/test/services/transcript.test.ts
+@@ -846,6 +846,32 @@ describe('AgentTranscriptProjector', () => {
+     expect(step.endMessage).toBe('user cancelled');
+   });
+ 
++  it('keeps visible retry notices separate from model text after recovery', () => {
++    const tx = new AgentTranscript('main');
++    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID, {
++      stepFrames: (turnId, stepId) => turnOps(turnId, tx.getItems()).steps.find((step) => step.stepId === stepId)?.frames,
++    });
++    const feed = (event: ProjectorBusEvent): void => void tx.apply(projector.map(event));
++    feed(ev({ type: 'turn.started', turnId: 1, origin: { kind: 'user' } }));
++    feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
++    const retry = {
++      type: 'turn.step.retrying', turnId: 1, step: 1, failedAttempt: 1, nextAttempt: 2,
++      maxAttempts: 10, delayMs: 500, errorName: 'APIStatusError', errorMessage: 'private provider body', statusCode: 524,
++    };
++    feed(ev(retry));
++    feed(ev(retry));
++    feed(ev({ ...retry, failedAttempt: 2, nextAttempt: 3, delayMs: 1001, statusCode: undefined }));
++    feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
++    feed(ev({ type: 'assistant.delta', turnId: 1, delta: 'Recovered answer.' }));
++    feed(ev({ type: 'turn.step.completed', turnId: 1, step: 1 }));
++
++    expect(turnOps('t1', tx.getItems()).steps[0]?.frames).toEqual([
++      expect.objectContaining({ kind: 'text', role: 'assistant', text: 'System notice: Model request failed (HTTP 524). Retrying attempt 2/10 in 1s.' }),
++      expect.objectContaining({ kind: 'text', role: 'assistant', text: 'System notice: Model request failed. Retrying attempt 3/10 in 2s.' }),
++      expect.objectContaining({ kind: 'text', role: 'assistant', text: 'Recovered answer.' }),
++    ]);
++  });
++
+   it('sets retry on turn.step.retrying and clears it at the terminal upsert', () => {
+     const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+     const tx = new AgentTranscript('main');
+diff --git a/packages/node-sdk/test/session-prompt-events.test.ts b/packages/node-sdk/test/session-prompt-events.test.ts
+index 56be2d42ecebcfef93d49c02d991d81975b2f909..39cce404d9eb3a32e788b9f665e987fe568ebeb4 100644
+--- a/packages/node-sdk/test/session-prompt-events.test.ts
++++ b/packages/node-sdk/test/session-prompt-events.test.ts
+@@ -96,6 +96,68 @@ async function removeTempDir(dir: string): Promise<void> {
+ }
+ 
+ describe('Session.prompt events', () => {
++  it('retries HTTP 524 during a goal without replaying completed tools', async () => {
++    const homeDir = await makeTempDir();
++    const workDir = await makeTempDir();
++    const harness = createKimiHarness({ identity: TEST_IDENTITY, homeDir });
++    const requests: Array<{ messages: unknown }> = [];
++    fetchStub!.mockImplementation(
++      async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
++        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++        if (url !== MODEL_URL) throw new Error(`Unexpected fetch: ${url}`);
++        if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
++        requests.push(JSON.parse(init.body));
++        if (requests.length === 2) return new Response(null, { status: 524 });
++        const body = requests.length === 1 || requests.length === 3
++          ? [
++              sseChunk({
++                role: 'assistant',
++                tool_calls: [{
++                  index: 0,
++                  id: requests.length === 1 ? 'inspect-goal' : 'finish-goal',
++                  type: 'function',
++                  function: {
++                    name: requests.length === 1 ? 'GetGoal' : 'UpdateGoal',
++                    arguments: requests.length === 1 ? '{}' : JSON.stringify({ status: 'complete' }),
++                  },
++                }],
++              }),
++              sseChunk({}, 'tool_calls'),
++              'data: [DONE]',
++            ].map((line) => `${line}\n\n`).join('')
++          : sseBody('Goal completed after retry.');
++        return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
++      },
++    );
++
++    try {
++      await configureFakeProvider(harness);
++      const session = await harness.createSession({ id: 'ses_goal_retry', workDir });
++      await session.createGoal({ objective: 'Inspect the goal, then complete it' });
++      const events: Event[] = [];
++      session.onEvent((event) => events.push(event));
++      await session.prompt('Inspect the goal and complete it.');
++      await vi.waitFor(() => {
++        expect(events.some((event) => event.type === 'turn.ended')).toBe(true);
++      }, { timeout: 10_000 });
++
++      expect(events.filter((event) => event.type === 'turn.ended')).toEqual([
++        expect.objectContaining({ reason: 'completed' }),
++      ]);
++      const goalUpdates = events.filter((event) => event.type === 'goal.updated');
++      expect(goalUpdates.some((event) => event.change?.kind === 'completion')).toBe(true);
++      expect(goalUpdates.some((event) => event.snapshot?.status === 'paused')).toBe(false);
++      await expect(session.getGoal()).resolves.toEqual({ goal: null });
++      const results = events.filter((event) => event.type === 'tool.result');
++      expect(results).toHaveLength(2);
++      expect(results.every((event) => event.isError !== true)).toBe(true);
++      expect(requests).toHaveLength(4);
++      expect(requests[2]?.messages).toEqual(requests[1]?.messages);
++    } finally {
++      await harness.close();
++    }
++  });
++
+   it('continues notifying sessions after disabling and restarting with identical prompt and tools', async () => {
+     vi.stubEnv('KIMI_CODE_EXPERIMENTAL_FLAG', '0');
+     vi.stubEnv('KIMI_CODE_EXPERIMENTAL_NOTIFY_USER', '');
+-- 
+2.50.1 (Apple Git-155)
+

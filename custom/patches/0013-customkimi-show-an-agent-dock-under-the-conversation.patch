@@ -1,0 +1,1523 @@
+From 3a1fd3f41a5fe9943742c419951915ec934e16fe Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Sat, 17 Oct 2026 01:09:40 +0200
+Subject: [PATCH 13/13] customkimi: show an agent dock under the conversation
+
+---
+ .changeset/agent-dock.md                      |   5 +
+ .../src/tui/components/chrome/agent-dock.ts   | 364 ++++++++++++++++++
+ .../dialogs/agent-activity-viewer.ts          |  61 +--
+ .../components/messages/agent-conversation.ts | 116 ++++++
+ .../messages/subagent-activity-lines.ts       |  78 ++++
+ .../tui/controllers/agent-dock-controller.ts  | 216 +++++++++++
+ .../src/tui/controllers/editor-keyboard.ts    |   5 +-
+ .../controllers/subagent-activity-store.ts    |  34 +-
+ .../tui/controllers/subagent-event-handler.ts |   5 +
+ apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
+ apps/kimi-code/src/tui/tui-state.ts           |   5 +
+ .../tui/components/chrome/agent-dock.test.ts  | 214 ++++++++++
+ .../messages/agent-conversation.test.ts       |  76 ++++
+ .../subagent-activity-store.test.ts           |  28 ++
+ 14 files changed, 1157 insertions(+), 57 deletions(-)
+ create mode 100644 .changeset/agent-dock.md
+ create mode 100644 apps/kimi-code/src/tui/components/chrome/agent-dock.ts
+ create mode 100644 apps/kimi-code/src/tui/components/messages/agent-conversation.ts
+ create mode 100644 apps/kimi-code/src/tui/components/messages/subagent-activity-lines.ts
+ create mode 100644 apps/kimi-code/src/tui/controllers/agent-dock-controller.ts
+ create mode 100644 apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts
+ create mode 100644 apps/kimi-code/test/tui/components/messages/agent-conversation.test.ts
+
+diff --git a/.changeset/agent-dock.md b/.changeset/agent-dock.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c2c6e99848ff9a91c101d0316921d74bab43657
+--- /dev/null
++++ b/.changeset/agent-dock.md
+@@ -0,0 +1,5 @@
++---
++"@moonshot-ai/kimi-code": patch
++---
++
++Show every running subagent as a row under the conversation; `↓` selects a row, `Enter` opens that agent's conversation live, and finished agents turn green before leaving the list.
+diff --git a/apps/kimi-code/src/tui/components/chrome/agent-dock.ts b/apps/kimi-code/src/tui/components/chrome/agent-dock.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9801b9a3519806f0de75d0d1f7b2a13061f616e8
+--- /dev/null
++++ b/apps/kimi-code/src/tui/components/chrome/agent-dock.ts
+@@ -0,0 +1,364 @@
++/**
++ * AgentDock — the list of agents shown under the conversation.
++ *
++ * One row per subagent of the session, led by a status dot: it pulses while
++ * the agent runs, turns green when the agent completed and red when it
++ * failed; finished rows linger for a few seconds and then drop off. `↓` on an
++ * empty editor focuses the dock, `↑`/`↓` move the selection, `Enter` opens the
++ * selected agent's own conversation and `Esc` returns to the editor.
++ *
++ * The dock keeps its own reference to each agent's activity record: the store
++ * drops foreground-only records once they end, but a finished row must stay
++ * openable until it leaves the dock.
++ */
++
++import {
++  Key,
++  matchesKey,
++  truncateToWidth,
++  type Component,
++  type Focusable,
++} from '@moonshot-ai/pi-tui';
++
++import { SELECT_POINTER, STATUS_BULLET } from '#/tui/constant/symbols';
++import type { SubagentActivityRecord } from '#/tui/controllers/subagent-activity-store';
++import { currentTheme } from '#/tui/theme';
++import { printableChar } from '#/tui/utils/printable-key';
++
++import { extractKeyArgument } from '../messages/tool-call';
++
++export type AgentDockRowStatus = 'running' | 'completed' | 'failed' | 'ended';
++
++export interface AgentDockRow {
++  readonly agentId: string;
++  readonly record: SubagentActivityRecord;
++  readonly startedAt: number;
++  status: AgentDockRowStatus;
++  finishedAt?: number;
++}
++
++export interface AgentDockOptions {
++  /** Enter on a row while the main chat is shown. */
++  readonly onOpen: (row: AgentDockRow) => void;
++  /** The selection moved while an agent's conversation is shown. */
++  readonly onSelect?: (row: AgentDockRow) => void;
++  /** Enter / Esc while an agent's conversation is shown: back to the chat. */
++  readonly onBack?: () => void;
++  /** The keyboard goes back to the editor. */
++  readonly onLeave: () => void;
++  readonly requestRender: () => void;
++  readonly now?: () => number;
++}
++
++/** How long a finished row stays in the dock. */
++export const COMPLETED_LINGER_MS = 8_000;
++export const FAILED_LINGER_MS = 20_000;
++const TICK_MS = 250;
++const ELLIPSIS = '…';
++const DESCRIPTION_MAX_CHARS = 48;
++/** The running dot cycles through these colors, one step per tick. */
++const PULSE_COLORS = ['primary', 'accent', 'textMuted', 'accent'] as const;
++
++function formatElapsed(ms: number): string {
++  const total = Math.max(0, Math.floor(ms / 1000));
++  const minutes = Math.floor(total / 60);
++  const seconds = total % 60;
++  if (minutes === 0) return `${String(seconds)}s`;
++  return `${String(minutes)}m ${String(seconds).padStart(2, '0')}s`;
++}
++
++function toolCallCount(record: SubagentActivityRecord): number {
++  let count = 0;
++  for (const step of record.steps) count += step.toolCalls.length;
++  return count;
++}
++
++/** Name + key argument of the tool call still running, if any. */
++function runningTool(record: SubagentActivityRecord): string | undefined {
++  for (let i = record.steps.length - 1; i >= 0; i--) {
++    const calls = record.steps[i]!.toolCalls;
++    for (let j = calls.length - 1; j >= 0; j--) {
++      const call = calls[j]!;
++      if (call.status !== 'running' || call.name.length === 0) continue;
++      const keyArg = extractKeyArgument(call.name, call.args);
++      return keyArg === null || keyArg.length === 0 ? call.name : `${call.name} ${keyArg}`;
++    }
++  }
++  return undefined;
++}
++
++function rowStatusOf(record: SubagentActivityRecord): AgentDockRowStatus {
++  return record.status;
++}
++
++export class AgentDockComponent implements Component, Focusable {
++  focused = false;
++  /** An agent's conversation is shown in place of the main chat. */
++  viewing = false;
++
++  private readonly rows: AgentDockRow[] = [];
++  private selected = 0;
++  private tick = 0;
++  private timer: ReturnType<typeof setInterval> | undefined;
++  private readonly now: () => number;
++
++  constructor(private readonly options: AgentDockOptions) {
++    this.now = options.now ?? (() => Date.now());
++  }
++
++  // ── rows ───────────────────────────────────────────────────────────
++
++  /** Add the agent's row or refresh its status from the record. */
++  upsert(record: SubagentActivityRecord): void {
++    const status = rowStatusOf(record);
++    let row = this.rows.find((r) => r.agentId === record.agentId);
++    if (row === undefined) {
++      row = { agentId: record.agentId, record, startedAt: this.now(), status };
++      this.rows.push(row);
++    }
++    if (row.status !== status) {
++      row.status = status;
++      row.finishedAt = status === 'running' ? undefined : this.now();
++    }
++    this.ensureTimer();
++    this.options.requestRender();
++  }
++
++  /** The store dropped the record: an agent still shown as running ended
++   *  without a terminal event (aborted turn). */
++  markDropped(agentId: string): void {
++    const row = this.rows.find((r) => r.agentId === agentId);
++    if (row === undefined || row.status !== 'running') return;
++    row.status = 'ended';
++    row.finishedAt = this.now();
++    this.options.requestRender();
++  }
++
++  clear(): void {
++    this.rows.length = 0;
++    this.selected = 0;
++    this.viewing = false;
++    this.stopTimer();
++    if (this.focused) {
++      this.focused = false;
++      this.options.onLeave();
++    }
++    this.options.requestRender();
++  }
++
++  isEmpty(): boolean {
++    return this.rows.length === 0;
++  }
++
++  has(agentId: string): boolean {
++    return this.rows.some((r) => r.agentId === agentId);
++  }
++
++  snapshot(): readonly AgentDockRow[] {
++    return [...this.rows];
++  }
++
++  selectedRow(): AgentDockRow | undefined {
++    return this.rows[this.selected];
++  }
++
++  // ── focus ──────────────────────────────────────────────────────────
++
++  /** Take the selection; false when there is nothing to select. */
++  focus(): boolean {
++    if (this.rows.length === 0) return false;
++    this.focused = true;
++    this.selected = Math.min(this.selected, this.rows.length - 1);
++    this.options.requestRender();
++    return true;
++  }
++
++  blur(): void {
++    this.focused = false;
++    this.viewing = false;
++    this.options.requestRender();
++  }
++
++  /** Current animation step (drives the working indicator of the open conversation). */
++  animationTick(): number {
++    return this.tick;
++  }
++
++  // ── input ──────────────────────────────────────────────────────────
++
++  handleInput(data: string): void {
++    const k = printableChar(data);
++    const isEnter = matchesKey(data, Key.enter) || matchesKey(data, Key.return);
++    const isEscape = matchesKey(data, Key.escape) || k === 'q' || k === 'Q';
++    const isUp = matchesKey(data, Key.up) || k === 'k';
++    const isDown = matchesKey(data, Key.down) || k === 'j';
++
++    if (this.viewing) {
++      if (isEnter || isEscape) {
++        this.options.onBack?.();
++        return;
++      }
++      if ((isUp && this.selected > 0) || (isDown && this.selected < this.rows.length - 1)) {
++        this.selected += isUp ? -1 : 1;
++        const row = this.selectedRow();
++        if (row !== undefined) this.options.onSelect?.(row);
++        this.options.requestRender();
++      }
++      return;
++    }
++
++    if (isEscape) {
++      this.blur();
++      this.options.onLeave();
++      return;
++    }
++    if (isUp) {
++      if (this.selected > 0) {
++        this.selected -= 1;
++        this.options.requestRender();
++      }
++      return;
++    }
++    if (isDown) {
++      if (this.selected < this.rows.length - 1) {
++        this.selected += 1;
++        this.options.requestRender();
++        return;
++      }
++      // Past the last row the arrow lands back in the editor below.
++      this.blur();
++      this.options.onLeave();
++      return;
++    }
++    if (isEnter) {
++      const row = this.selectedRow();
++      if (row !== undefined) this.options.onOpen(row);
++    }
++  }
++
++  // ── timers ─────────────────────────────────────────────────────────
++
++  private ensureTimer(): void {
++    if (this.timer !== undefined) return;
++    this.timer = setInterval(() => {
++      this.tick += 1;
++      this.expire();
++      if (this.rows.length === 0) this.stopTimer();
++      this.options.requestRender();
++    }, TICK_MS);
++    this.timer.unref?.();
++  }
++
++  private stopTimer(): void {
++    if (this.timer === undefined) return;
++    clearInterval(this.timer);
++    this.timer = undefined;
++  }
++
++  /** Drop finished rows past their linger time. The row the user is on while
++   *  the dock is focused stays so it can still be opened. */
++  expire(): void {
++    const now = this.now();
++    for (let i = this.rows.length - 1; i >= 0; i--) {
++      const row = this.rows[i]!;
++      if (row.finishedAt === undefined) continue;
++      if (this.focused && i === this.selected) continue;
++      const linger = row.status === 'failed' ? FAILED_LINGER_MS : COMPLETED_LINGER_MS;
++      if (now - row.finishedAt < linger) continue;
++      this.rows.splice(i, 1);
++      if (this.selected > i || this.selected >= this.rows.length) {
++        this.selected = Math.max(0, Math.min(this.selected, this.rows.length - 1));
++      }
++    }
++    if (this.rows.length === 0 && this.focused) {
++      this.focused = false;
++      this.options.onLeave();
++    }
++  }
++
++  dispose(): void {
++    this.stopTimer();
++  }
++
++  // ── render ─────────────────────────────────────────────────────────
++
++  invalidate(): void {}
++
++  render(width: number): string[] {
++    if (this.rows.length === 0) return [];
++    const out: string[] = [''];
++    this.rows.forEach((row, index) => {
++      out.push(this.renderRow(row, index, width));
++    });
++    out.push(this.renderHint(width));
++    return out;
++  }
++
++  private renderRow(row: AgentDockRow, index: number, width: number): string {
++    const isSelected = this.focused && index === this.selected;
++    const pointer = isSelected ? currentTheme.fg('primary', `${SELECT_POINTER} `) : '  ';
++    const { record } = row;
++    const name = isSelected
++      ? currentTheme.boldFg('primary', record.agentName)
++      : currentTheme.boldFg('text', record.agentName);
++
++    const parts: string[] = [];
++    if (record.description !== undefined && record.description.length > 0) {
++      parts.push(truncateToWidth(record.description, DESCRIPTION_MAX_CHARS, ELLIPSIS));
++    }
++    if (record.model !== undefined && record.model.length > 0) parts.push(record.model);
++    if (record.effort !== undefined && record.effort.length > 0) parts.push(record.effort);
++    const tools = toolCallCount(record);
++    if (tools > 0) parts.push(`${String(tools)} tools`);
++    parts.push(formatElapsed((row.finishedAt ?? this.now()) - row.startedAt));
++
++    let trailing = '';
++    switch (row.status) {
++      case 'running': {
++        const tool = runningTool(record);
++        if (tool !== undefined) trailing = currentTheme.fg('textMuted', ` · ${tool}`);
++        break;
++      }
++      case 'completed':
++        trailing = currentTheme.fg('success', ' · done');
++        break;
++      case 'failed':
++        trailing = currentTheme.fg('error', ' · failed');
++        break;
++      case 'ended':
++        trailing = currentTheme.fg('textMuted', ' · ended');
++        break;
++    }
++
++    const detail = parts.length > 0 ? currentTheme.dim(` · ${parts.join(' · ')}`) : '';
++    const line = `${pointer}${this.renderDot(row)}${name}${detail}${trailing}`;
++    return truncateToWidth(line, width, ELLIPSIS);
++  }
++
++  private renderDot(row: AgentDockRow): string {
++    switch (row.status) {
++      case 'running':
++        return currentTheme.fg(PULSE_COLORS[this.tick % PULSE_COLORS.length]!, STATUS_BULLET);
++      case 'completed':
++        return currentTheme.fg('success', STATUS_BULLET);
++      case 'failed':
++        return currentTheme.fg('error', STATUS_BULLET);
++      case 'ended':
++        return currentTheme.fg('textMuted', STATUS_BULLET);
++    }
++  }
++
++  private renderHint(width: number): string {
++    const key = (text: string): string => currentTheme.boldFg('primary', text);
++    const dim = (text: string): string => currentTheme.fg('textMuted', text);
++    let hint: string;
++    if (this.viewing) {
++      hint = `  ${key('↑↓')} ${dim('other agent')}  ${key('Enter')}${dim('/')}${key('Esc')} ${dim('back to chat')}`;
++    } else if (this.focused) {
++      hint = `  ${key('↑↓')} ${dim('select')}  ${key('Enter')} ${dim('open agent')}  ${key('Esc')} ${dim('back')}`;
++    } else {
++      hint = `  ${key('↓')} ${dim('agents')}`;
++    }
++    return truncateToWidth(hint, width, ELLIPSIS);
++  }
++}
+diff --git a/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts b/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
+index 6a58d9ffd5b80cdfcf94560c4c8e031e33e36672..fae442208392dccc8b4f34ab5c06f6d44156547c 100644
+--- a/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
++++ b/apps/kimi-code/src/tui/components/dialogs/agent-activity-viewer.ts
+@@ -26,7 +26,6 @@ import {
+ import type { BackgroundTaskInfo } from '@moonshot-ai/kimi-code-sdk';
+ 
+ import { MESSAGE_INDENT } from '#/tui/constant/rendering';
+-import { STATUS_BULLET } from '#/tui/constant/symbols';
+ import type {
+   SubagentActivityRecord,
+   SubToolCallActivity,
+@@ -35,9 +34,12 @@ import { currentTheme } from '#/tui/theme';
+ import type { ToolCallBlockData } from '#/tui/types';
+ import { printableChar } from '#/tui/utils/printable-key';
+ import { AssistantMessageComponent } from '../messages/assistant-message';
++import {
++  buildSubagentToolCallHeader,
++  renderSubagentToolCallBody,
++} from '../messages/subagent-activity-lines';
+ import { extractKeyArgument } from '../messages/tool-call';
+ import { pickChip } from '../messages/tool-renderers/chip';
+-import { pickResultRenderer } from '../messages/tool-renderers/registry';
+ import { STATUS_LABEL, statusColor } from './task-output-viewer';
+ 
+ const ELLIPSIS = '…';
+@@ -218,63 +220,12 @@ export class AgentActivityViewer extends Container implements Focusable {
+     return out;
+   }
+ 
+-  /** Same shape as the main flow's generic header (`tool-call.ts`
+-   *  `buildHeader`): bullet + verb + name + key argument + chip. Custom
+-   *  per-tool label wording (e.g. "Ran a command") is intentionally not
+-   *  mirrored — the per-tool *body* renderers carry the specialization. */
+   private buildToolCallHeader(call: SubToolCallActivity): string {
+-    let bullet: string;
+-    if (call.status === 'error') {
+-      bullet = currentTheme.fg('error', '✗ ');
+-    } else if (call.status === 'done') {
+-      bullet = currentTheme.fg('success', STATUS_BULLET);
+-    } else {
+-      bullet = currentTheme.fg('text', STATUS_BULLET);
+-    }
+-    const verb = call.status === 'running' ? 'Using' : 'Used';
+-    const name = currentTheme.boldFg('primary', call.name);
+-    const keyArg = extractKeyArgument(call.name, call.args);
+-    const argStr = keyArg === null || keyArg.length === 0 ? '' : currentTheme.dim(` (${keyArg})`);
+-
+-    let chipStr = '';
+-    if (call.result !== undefined) {
+-      const provider = pickChip(call.name);
+-      const text = provider?.(this.toToolCallBlockData(call), call.result) ?? '';
+-      if (text.length > 0) {
+-        chipStr =
+-          call.result.is_error === true
+-            ? currentTheme.fg('error', ` · ${text}`)
+-            : currentTheme.dim(` · ${text}`);
+-      }
+-    }
+-    return `${bullet}${verb} ${name}${argStr}${chipStr}`;
++    return buildSubagentToolCallHeader(call);
+   }
+ 
+   private renderToolCallBody(call: SubToolCallActivity, innerWidth: number): string[] {
+-    if (call.result === undefined) {
+-      return call.liveOutputTail === undefined || call.liveOutputTail.length === 0
+-        ? []
+-        : [currentTheme.dim(`${MESSAGE_INDENT}│ ${call.liveOutputTail}`)];
+-    }
+-    // The store caps retained output, which cannot survive as a parseable
+-    // media envelope (base64) — show a marker instead of dumping the blob.
+-    if (call.name === 'ReadMediaFile' && call.result.is_error !== true) {
+-      return [currentTheme.dim(`${MESSAGE_INDENT}[media output omitted]`)];
+-    }
+-    const components = pickResultRenderer(call.name)(
+-      this.toToolCallBlockData(call),
+-      call.result,
+-      { expanded: this.expanded },
+-    );
+-    const out: string[] = [];
+-    for (const component of components) {
+-      out.push(...component.render(innerWidth));
+-    }
+-    return out;
+-  }
+-
+-  private toToolCallBlockData(call: SubToolCallActivity): ToolCallBlockData {
+-    return { id: call.id, name: call.name, args: call.args };
++    return renderSubagentToolCallBody(call, innerWidth, this.expanded);
+   }
+ 
+   // ── render ─────────────────────────────────────────────────────────
+diff --git a/apps/kimi-code/src/tui/components/messages/agent-conversation.ts b/apps/kimi-code/src/tui/components/messages/agent-conversation.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e92a72faad9ba5ee79496d1e4730e2bc6291e32
+--- /dev/null
++++ b/apps/kimi-code/src/tui/components/messages/agent-conversation.ts
+@@ -0,0 +1,116 @@
++/**
++ * AgentConversationComponent — a subagent's conversation shown in place of
++ * the main transcript, in the main transcript's own shape: the task prompt
++ * the parent gave the agent as a user message, then each step's assistant
++ * text (Markdown) and tool calls through the main-flow renderers, and the
++ * agent's result or failure at the end. It renders from the agent's
++ * `SubagentActivityRecord` snapshot and re-renders when the record's version
++ * moves, so it stays live while the agent runs.
++ */
++
++import { Spacer, type Component } from '@moonshot-ai/pi-tui';
++
++import { MESSAGE_INDENT } from '#/tui/constant/rendering';
++import type { SubagentActivityRecord } from '#/tui/controllers/subagent-activity-store';
++import { currentTheme } from '#/tui/theme';
++
++import { AssistantMessageComponent } from './assistant-message';
++import { buildSubagentToolCallHeader, renderSubagentToolCallBody } from './subagent-activity-lines';
++import { UserMessageComponent } from './user-message';
++
++const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
++
++export interface AgentConversationOptions {
++  /** Expand every tool result (main transcript's `toolOutputExpanded`). */
++  readonly expanded?: () => boolean;
++  /** Animation step for the working indicator while the agent runs. */
++  readonly tick?: () => number;
++}
++
++export class AgentConversationComponent implements Component {
++  private cache: { key: string; lines: string[] } | undefined;
++
++  constructor(
++    readonly record: SubagentActivityRecord,
++    private readonly options: AgentConversationOptions = {},
++  ) {}
++
++  invalidate(): void {
++    this.cache = undefined;
++  }
++
++  render(width: number): string[] {
++    const expanded = this.options.expanded?.() ?? false;
++    const tick = this.record.status === 'running' ? (this.options.tick?.() ?? 0) : -1;
++    const key = `${String(width)}|${String(this.record.version)}|${expanded ? 'x' : 'c'}|${String(tick)}`;
++    if (this.cache?.key === key) return this.cache.lines;
++    const lines = this.build(width, expanded, tick);
++    this.cache = { key, lines };
++    return lines;
++  }
++
++  private build(width: number, expanded: boolean, tick: number): string[] {
++    const { record } = this;
++    const out: string[] = [];
++    const push = (component: Component): void => {
++      out.push(...component.render(width));
++    };
++
++    push(new Spacer(1));
++    out.push(this.header());
++    push(new UserMessageComponent(record.prompt ?? record.description ?? '(no prompt recorded)'));
++
++    for (const step of record.steps) {
++      if (step.retrying !== undefined) {
++        out.push(currentTheme.fg('warning', `${MESSAGE_INDENT}↻ ${step.retrying}`));
++      }
++      if (step.textTail.trim().length > 0) {
++        const message = new AssistantMessageComponent();
++        message.updateContent(step.textTail);
++        push(message);
++      }
++      for (const call of step.toolCalls) {
++        out.push('');
++        out.push(buildSubagentToolCallHeader(call));
++        out.push(...renderSubagentToolCallBody(call, width, expanded));
++      }
++    }
++
++    if (record.status === 'running') {
++      out.push('');
++      out.push(currentTheme.dim(`${SPINNER[tick % SPINNER.length]!} ${record.agentName} is working…`));
++    } else if (record.error !== undefined && record.error.length > 0) {
++      push(new Spacer(1));
++      out.push(currentTheme.fg('error', `✗ ${record.agentName} failed`));
++      const message = new AssistantMessageComponent();
++      message.updateContent(record.error);
++      push(message);
++    } else if (record.resultSummary !== undefined && record.resultSummary.length > 0) {
++      push(new Spacer(1));
++      out.push(currentTheme.boldFg('success', `✓ ${record.agentName} finished`));
++      const message = new AssistantMessageComponent();
++      message.updateContent(record.resultSummary);
++      push(message);
++    }
++    out.push('');
++    return out;
++  }
++
++  /** One muted line so the swapped transcript is recognizable as an agent's. */
++  private header(): string {
++    const { record } = this;
++    const label =
++      record.description !== undefined && record.description.length > 0
++        ? `${record.agentName} › ${record.description}`
++        : record.agentName;
++    const meta = [record.model, record.effort].filter(
++      (part): part is string => part !== undefined && part.length > 0,
++    );
++    const metaStr = meta.length > 0 ? ` · ${meta.join(' · ')}` : '';
++    let range = '';
++    if (record.totalSteps > record.steps.length) {
++      range = ` · earlier steps discarded`;
++    }
++    return currentTheme.fg('textMuted', `agent ${label}${metaStr}${range}`);
++  }
++}
+diff --git a/apps/kimi-code/src/tui/components/messages/subagent-activity-lines.ts b/apps/kimi-code/src/tui/components/messages/subagent-activity-lines.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..15b5b026d6f6468943ef7adb5324e89d0c6e18a0
+--- /dev/null
++++ b/apps/kimi-code/src/tui/components/messages/subagent-activity-lines.ts
+@@ -0,0 +1,78 @@
++/**
++ * Renders one subagent tool call from a `SubagentActivityRecord` snapshot the
++ * way the main transcript renders its own: the generic header (bullet + verb +
++ * name + key argument + chip) and the per-tool result body through the
++ * main-flow renderers. Shared by the full-screen activity viewer and the
++ * inline agent conversation. `ToolCallComponent` itself is not reused — it is
++ * a live, event-driven component, while these render a snapshot.
++ */
++
++import { MESSAGE_INDENT } from '#/tui/constant/rendering';
++import { STATUS_BULLET } from '#/tui/constant/symbols';
++import type { SubToolCallActivity } from '#/tui/controllers/subagent-activity-store';
++import { currentTheme } from '#/tui/theme';
++import type { ToolCallBlockData } from '#/tui/types';
++
++import { extractKeyArgument } from './tool-call';
++import { pickChip } from './tool-renderers/chip';
++import { pickResultRenderer } from './tool-renderers/registry';
++
++function toToolCallBlockData(call: SubToolCallActivity): ToolCallBlockData {
++  return { id: call.id, name: call.name, args: call.args };
++}
++
++/** Same shape as the main flow's generic header (`tool-call.ts` `buildHeader`).
++ *  Custom per-tool label wording (e.g. "Ran a command") is intentionally not
++ *  mirrored — the per-tool *body* renderers carry the specialization. */
++export function buildSubagentToolCallHeader(call: SubToolCallActivity): string {
++  let bullet: string;
++  if (call.status === 'error') {
++    bullet = currentTheme.fg('error', '✗ ');
++  } else if (call.status === 'done') {
++    bullet = currentTheme.fg('success', STATUS_BULLET);
++  } else {
++    bullet = currentTheme.fg('text', STATUS_BULLET);
++  }
++  const verb = call.status === 'running' ? 'Using' : 'Used';
++  const name = currentTheme.boldFg('primary', call.name);
++  const keyArg = extractKeyArgument(call.name, call.args);
++  const argStr = keyArg === null || keyArg.length === 0 ? '' : currentTheme.dim(` (${keyArg})`);
++
++  let chipStr = '';
++  if (call.result !== undefined) {
++    const provider = pickChip(call.name);
++    const text = provider?.(toToolCallBlockData(call), call.result) ?? '';
++    if (text.length > 0) {
++      chipStr =
++        call.result.is_error === true
++          ? currentTheme.fg('error', ` · ${text}`)
++          : currentTheme.dim(` · ${text}`);
++    }
++  }
++  return `${bullet}${verb} ${name}${argStr}${chipStr}`;
++}
++
++export function renderSubagentToolCallBody(
++  call: SubToolCallActivity,
++  innerWidth: number,
++  expanded: boolean,
++): string[] {
++  if (call.result === undefined) {
++    return call.liveOutputTail === undefined || call.liveOutputTail.length === 0
++      ? []
++      : [currentTheme.dim(`${MESSAGE_INDENT}│ ${call.liveOutputTail}`)];
++  }
++  // The store caps retained output, which cannot survive as a parseable
++  // media envelope (base64) — show a marker instead of dumping the blob.
++  if (call.name === 'ReadMediaFile' && call.result.is_error !== true) {
++    return [currentTheme.dim(`${MESSAGE_INDENT}[media output omitted]`)];
++  }
++  const components = pickResultRenderer(call.name)(toToolCallBlockData(call), call.result, {
++    expanded,
++  });
++  const out: string[] = [];
++  for (const component of components) {
++    out.push(...component.render(innerWidth));
++  }
++  return out;
++}
+diff --git a/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts b/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b8daad83b08305ca2e7da13206aa179e99319bf
+--- /dev/null
++++ b/apps/kimi-code/src/tui/controllers/agent-dock-controller.ts
+@@ -0,0 +1,216 @@
++/**
++ * AgentDockController — wires the agent dock under the conversation to the
++ * subagent activity store and shows an agent's conversation on Enter.
++ *
++ * The dock mirrors the store: every spawned subagent gets a row, status
++ * follows the record, and a dropped record (foreground agent of an aborted
++ * turn) marks the row ended. Opening a row swaps the main transcript for an
++ * `AgentConversationComponent` in place — the dock, editor and footer stay
++ * where they are, so the agent reads like the normal chat. `↑`/`↓` then
++ * switch to another agent, `Enter`/`Esc` bring the main chat back. The
++ * conversation stays live through the store subscription and the dock's
++ * animation timer.
++ */
++
++import { TuiAltScreen, VStack, type Component } from '@moonshot-ai/pi-tui';
++
++import { AgentDockComponent, type AgentDockRow } from '#/tui/components/chrome/agent-dock';
++import { GutterContainer } from '#/tui/components/chrome/gutter-container';
++import { AgentConversationComponent } from '#/tui/components/messages/agent-conversation';
++import { TranscriptView } from '#/tui/components/messages/transcript-view';
++import { CHROME_GUTTER } from '#/tui/constant/rendering';
++import type { SessionEventHandler } from '#/tui/controllers/session-event-handler';
++import type { SubagentActivityChange } from '#/tui/controllers/subagent-activity-store';
++import type { TUIState } from '#/tui/tui-state';
++
++export interface AgentDockHost {
++  readonly state: TUIState;
++  readonly sessionEventHandler: SessionEventHandler;
++}
++
++/** The main transcript's slot while an agent's conversation replaces it. */
++type TranscriptSwap =
++  | { readonly kind: 'root'; readonly root: Component | undefined }
++  | { readonly kind: 'children'; readonly index: number };
++
++interface OpenConversation {
++  readonly row: AgentDockRow;
++  readonly component: AgentConversationComponent;
++  readonly swap: TranscriptSwap;
++}
++
++/** Coalesce the per-delta store notifications into a few renders a second. */
++const RENDER_COALESCE_MS = 80;
++
++export class AgentDockController {
++  readonly dock: AgentDockComponent;
++  private open: OpenConversation | undefined;
++  private renderTimer: ReturnType<typeof setTimeout> | undefined;
++  private readonly unsubscribe: () => void;
++
++  constructor(private readonly host: AgentDockHost) {
++    this.dock = new AgentDockComponent({
++      onOpen: (row) => {
++        this.show(row);
++      },
++      onSelect: (row) => {
++        this.show(row);
++      },
++      onBack: () => {
++        this.closeConversation();
++      },
++      onLeave: () => {
++        this.focusEditor();
++      },
++      requestRender: () => {
++        this.scheduleRender();
++      },
++    });
++    host.state.agentDockContainer.addChild(this.dock);
++    this.unsubscribe = this.store.subscribe((change) => {
++      this.onStoreChange(change);
++    });
++  }
++
++  private get store() {
++    return this.host.sessionEventHandler.subAgentEventHandler.activityStore;
++  }
++
++  /** `↓` on an empty editor: move the keyboard into the dock. */
++  focusFromEditor(): boolean {
++    if (!this.dock.focus()) return false;
++    this.host.state.ui.setFocus(this.dock);
++    return true;
++  }
++
++  isConversationOpen(): boolean {
++    return this.open !== undefined;
++  }
++
++  /** New session: nothing of the old one is left to show. */
++  reset(): void {
++    this.closeConversation();
++    this.dock.clear();
++  }
++
++  dispose(): void {
++    this.unsubscribe();
++    this.closeConversation();
++    this.dock.dispose();
++    if (this.renderTimer !== undefined) {
++      clearTimeout(this.renderTimer);
++      this.renderTimer = undefined;
++    }
++  }
++
++  private onStoreChange(change: SubagentActivityChange): void {
++    switch (change.kind) {
++      case 'update': {
++        const record = this.store.get(change.agentId);
++        if (record !== undefined) this.dock.upsert(record);
++        return;
++      }
++      case 'drop':
++        this.dock.markDropped(change.agentId);
++        return;
++      case 'clear':
++        this.reset();
++        return;
++    }
++  }
++
++  // ── the agent's conversation in place of the main transcript ───────
++
++  private show(row: AgentDockRow): void {
++    if (this.open?.row === row) return;
++    const { state } = this.host;
++    const component = new AgentConversationComponent(row.record, {
++      expanded: () => state.toolOutputExpanded,
++      tick: () => this.dock.animationTick(),
++    });
++    if (this.open !== undefined) {
++      // Switching agents: reuse the slot, only the content changes.
++      const swap = this.open.swap;
++      this.open = { row, component, swap };
++      this.mount(component, swap);
++    } else {
++      this.open = { row, component, swap: this.takeTranscriptSlot(component) };
++    }
++    this.dock.viewing = true;
++    state.ui.setFocus(this.dock);
++    state.ui.requestRender(true);
++  }
++
++  private closeConversation(): void {
++    const open = this.open;
++    if (open === undefined) return;
++    this.open = undefined;
++    this.dock.viewing = false;
++    this.restoreTranscriptSlot(open.swap);
++    const { state } = this.host;
++    if (this.dock.focus()) {
++      state.ui.setFocus(this.dock);
++    } else {
++      this.focusEditor();
++    }
++    state.ui.requestRender(true);
++  }
++
++  /** Put the conversation where the main transcript renders. Fullscreen keeps
++   *  the transcript in a ScrollView under the layout root; the regular layout
++   *  lists it as the first child of the UI. */
++  private takeTranscriptSlot(component: AgentConversationComponent): TranscriptSwap {
++    const { ui } = this.host.state;
++    if (ui instanceof TuiAltScreen) {
++      const swap: TranscriptSwap = { kind: 'root', root: ui.getLayoutRoot() };
++      this.mount(component, swap);
++      return swap;
++    }
++    const index = Math.max(0, ui.children.indexOf(this.host.state.transcriptContainer));
++    const swap: TranscriptSwap = { kind: 'children', index };
++    this.mount(component, swap);
++    return swap;
++  }
++
++  private mount(component: AgentConversationComponent, swap: TranscriptSwap): void {
++    const { state } = this.host;
++    const container = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
++    container.addChild(component);
++    if (swap.kind === 'root') {
++      const ui = state.ui as TuiAltScreen;
++      const root = new VStack();
++      root.addChild(new TranscriptView(container), { basis: 0, grow: 1, shrink: 1, minSize: 1 });
++      if (state.dockContainer !== undefined) {
++        root.addChild(state.dockContainer, { basis: 'auto', grow: 0, shrink: 1, minSize: 1 });
++      }
++      ui.setLayoutRoot(root);
++      return;
++    }
++    state.ui.children[swap.index] = container;
++  }
++
++  private restoreTranscriptSlot(swap: TranscriptSwap): void {
++    const { state } = this.host;
++    if (swap.kind === 'root') {
++      if (state.ui instanceof TuiAltScreen) state.ui.setLayoutRoot(swap.root);
++      return;
++    }
++    state.ui.children[swap.index] = state.transcriptContainer;
++  }
++
++  private focusEditor(): void {
++    this.dock.blur();
++    const { state } = this.host;
++    state.ui.setFocus(state.editor);
++    this.scheduleRender();
++  }
++
++  private scheduleRender(): void {
++    if (this.renderTimer !== undefined) return;
++    this.renderTimer = setTimeout(() => {
++      this.renderTimer = undefined;
++      this.host.state.ui.requestRender();
++    }, RENDER_COALESCE_MS);
++    this.renderTimer.unref?.();
++  }
++}
+diff --git a/apps/kimi-code/src/tui/controllers/editor-keyboard.ts b/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
+index 5fd7905479e4ec0545b9a441fd9914632f5fbd34..e10606230aa315f9e09c3a54b2b54dc19715289e 100644
+--- a/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
++++ b/apps/kimi-code/src/tui/controllers/editor-keyboard.ts
+@@ -30,6 +30,7 @@ import { extractMediaAttachments, imageExtensionForMime } from '../utils/image-p
+ import { resolveUserInput } from '../commands/resolve';
+ import type { PendingExit, QueuedMessage } from '../types';
+ import type { TUIState } from '../tui-state';
++import type { AgentDockController } from './agent-dock-controller';
+ import type { BtwPanelController } from './btw-panel';
+ import type { SurveyController } from './survey-controller';
+ import type { ModelMigrationController } from './model-migration';
+@@ -46,6 +47,7 @@ export interface EditorKeyboardHost {
+   harness?: KimiHarness | undefined;
+ 
+   handleUserInput(text: string): void;
++  readonly agentDockController: AgentDockController;
+   readonly btwPanelController: BtwPanelController;
+   readonly surveyController: SurveyController;
+   readonly modelMigration?: ModelMigrationController;
+@@ -422,7 +424,8 @@ export class EditorKeyboardController {
+       return false;
+     };
+ 
+-    editor.onDownArrowEmpty = () => host.btwPanelController.scroll('down');
++    editor.onDownArrowEmpty = () =>
++      host.agentDockController.focusFromEditor() || host.btwPanelController.scroll('down');
+ 
+     editor.onPasteImage = async () => this.handleClipboardImagePaste();
+   }
+diff --git a/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts b/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
+index 2f768513f99eb6e9e55ec2022c666f909a30becf..56fb970b975d4a423512948e6a6dc39d8c23390d 100644
+--- a/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
++++ b/apps/kimi-code/src/tui/controllers/subagent-activity-store.ts
+@@ -61,6 +61,8 @@ export interface SubagentActivityRecord {
+   readonly agentId: string;
+   readonly agentName: string;
+   readonly description?: string;
++  /** The task text the parent passed to the Agent tool (its user prompt). */
++  prompt?: string;
+   readonly parentToolCallId: string;
+   model?: string;
+   effort?: string;
+@@ -78,6 +80,7 @@ export interface SubagentActivitySpawn {
+   readonly agentId: string;
+   readonly agentName: string;
+   readonly description?: string;
++  readonly prompt?: string;
+   readonly parentToolCallId: string;
+   readonly model?: string;
+   readonly effort?: string;
+@@ -105,10 +108,32 @@ function capArgStrings(args: Record<string, unknown>): Record<string, unknown> {
+   return capped ?? args;
+ }
+ 
++/** Change notification for live views of the store (agent dock, open viewer).
++ *  `drop`/`clear` carry no record: a listener that holds a reference keeps it. */
++export type SubagentActivityChange =
++  | { readonly kind: 'update'; readonly agentId: string }
++  | { readonly kind: 'drop'; readonly agentId: string }
++  | { readonly kind: 'clear' };
++
++export type SubagentActivityListener = (change: SubagentActivityChange) => void;
++
+ export class SubagentActivityStore {
+   private readonly records = new Map<string, SubagentActivityRecord>();
+   /** Raw streaming-arguments buffer per in-flight tool call (from deltas). */
+   private readonly streamingArgs = new Map<string, string>();
++  private readonly listeners = new Set<SubagentActivityListener>();
++
++  /** Register a change listener; returns the unsubscribe function. */
++  subscribe(listener: SubagentActivityListener): () => void {
++    this.listeners.add(listener);
++    return () => {
++      this.listeners.delete(listener);
++    };
++  }
++
++  private emit(change: SubagentActivityChange): void {
++    for (const listener of this.listeners) listener(change);
++  }
+ 
+   ensureRecord(spawn: SubagentActivitySpawn): SubagentActivityRecord {
+     const existing = this.records.get(spawn.agentId);
+@@ -118,12 +143,15 @@ export class SubagentActivityStore {
+       existing.status = 'running';
+       existing.resultSummary = undefined;
+       existing.error = undefined;
++      if (spawn.prompt !== undefined) existing.prompt = spawn.prompt;
++      this.bump(existing);
+       return existing;
+     }
+     const record: SubagentActivityRecord = {
+       agentId: spawn.agentId,
+       agentName: spawn.agentName,
+       description: spawn.description,
++      prompt: spawn.prompt,
+       parentToolCallId: spawn.parentToolCallId,
+       model: spawn.model,
+       effort: spawn.effort,
+@@ -133,6 +161,7 @@ export class SubagentActivityStore {
+       version: 0,
+     };
+     this.records.set(spawn.agentId, record);
++    this.emit({ kind: 'update', agentId: record.agentId });
+     return record;
+   }
+ 
+@@ -286,6 +315,7 @@ export class SubagentActivityStore {
+   clear(): void {
+     this.records.clear();
+     this.streamingArgs.clear();
++    this.emit({ kind: 'clear' });
+   }
+ 
+   /** Drop one agent's record and its in-flight arg buffers. Used when a
+@@ -293,8 +323,9 @@ export class SubagentActivityStore {
+    *  /tasks) reaches a terminal state — its record would otherwise stay
+    *  resident until the session reset. */
+   drop(agentId: string): void {
+-    this.records.delete(agentId);
++    const existed = this.records.delete(agentId);
+     this.dropStreamingBuffers(agentId);
++    if (existed) this.emit({ kind: 'drop', agentId });
+   }
+ 
+   /** No more deltas arrive once the record is terminal, so any buffer left
+@@ -344,5 +375,6 @@ export class SubagentActivityStore {
+ 
+   private bump(record: SubagentActivityRecord): void {
+     record.version += 1;
++    this.emit({ kind: 'update', agentId: record.agentId });
+   }
+ }
+diff --git a/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts b/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
+index 93da7ab0b87697b8959bd7acc927a5e26abd0759..123c8a572b5ddca9d8a280f0db8996e2667dcf0b 100644
+--- a/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
++++ b/apps/kimi-code/src/tui/controllers/subagent-event-handler.ts
+@@ -495,10 +495,15 @@ export class SubAgentEventHandler {
+       runInBackground: event.runInBackground,
+       swarmIndex: event.swarmIndex,
+     });
++    // The task prompt only lives on the parent Agent tool call's arguments.
++    const parentPrompt = this.host.streamingUI.getActiveToolCall(event.parentToolCallId)?.args[
++      'prompt'
++    ];
+     this.activityStore.ensureRecord({
+       agentId: event.subagentId,
+       agentName: event.subagentName,
+       description: event.description,
++      prompt: typeof parentPrompt === 'string' && parentPrompt.length > 0 ? parentPrompt : undefined,
+       parentToolCallId: event.parentToolCallId,
+       model: this.spawnedModelDisplay(event),
+       effort: this.subagentEffortDisplay(event.thinkingEffort),
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index 9237e88eae53bdeda07c8d9c94bc697f2aa118e2..cf85eeb301eb4f6d49c852490c693bb363549542 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -141,6 +141,7 @@ import { SessionReplayRenderer } from './controllers/session-replay';
+ import { StagingLeaseTracker, type StagingLease } from './controllers/staging-leases';
+ import { StreamingUIController } from './controllers/streaming-ui';
+ import { SurveyController } from './controllers/survey-controller';
++import { AgentDockController } from './controllers/agent-dock-controller';
+ import { TasksBrowserController } from './controllers/tasks-browser';
+ import { installRainbowDance } from './easter-eggs/dance';
+ import { adaptPanelResponse } from './reverse-rpc/approval/adapter';
+@@ -403,6 +404,7 @@ export class KimiTUI {
+   readonly sessionEventHandler: SessionEventHandler;
+   readonly sessionReplay: SessionReplayRenderer;
+   readonly tasksBrowserController: TasksBrowserController;
++  readonly agentDockController: AgentDockController;
+   readonly surveyController: SurveyController;
+   readonly editorKeyboard: EditorKeyboardController;
+   readonly modelMigration: ModelMigrationController;
+@@ -520,6 +522,7 @@ export class KimiTUI {
+     this.btwPanelController = new BtwPanelController(this, this.imageStore, this.staging);
+     this.sessionEventHandler = new SessionEventHandler(this);
+     this.sessionReplay = new SessionReplayRenderer(this);
++    this.agentDockController = new AgentDockController(this);
+     this.tasksBrowserController = new TasksBrowserController(this);
+     this.surveyController = new SurveyController(this, {
+       accessToken: () => this.harness.auth.getCachedAccessToken(),
+@@ -1134,6 +1137,7 @@ export class KimiTUI {
+     // before tearing the UI down, so they can't keep firing requestRender after
+     // stop() returns (or leak when stop() runs without process.exit).
+     this.tasksBrowserController.close();
++    this.agentDockController.dispose();
+     this.btwPanelController.clear();
+     this.stopActivitySpinner();
+     this.streamingUI.disposeActiveCompactionBlock();
+@@ -1283,6 +1287,7 @@ export class KimiTUI {
+     ui.clear();
+     ui.addChild(this.state.transcriptContainer);
+     ui.addChild(this.state.activityContainer);
++    ui.addChild(this.state.agentDockContainer);
+     ui.addChild(this.state.todoPanelContainer);
+     ui.addChild(this.state.notifyPanelContainer);
+     ui.addChild(this.state.queueContainer);
+@@ -1324,6 +1329,7 @@ export class KimiTUI {
+     const main = new TuiMainScreen(ui.terminal);
+     main.addChild(this.state.transcriptContainer);
+     main.addChild(this.state.activityContainer);
++    main.addChild(this.state.agentDockContainer);
+     main.addChild(this.state.todoPanelContainer);
+     main.addChild(this.state.notifyPanelContainer);
+     main.addChild(this.state.queueContainer);
+@@ -3165,6 +3171,7 @@ export class KimiTUI {
+     this.streamingUI.resetToolCallState();
+     this.streamingUI.resetToolUi();
+     this.sessionEventHandler.resetRuntimeState();
++    this.agentDockController.reset();
+     this.tasksBrowserController.close();
+     this.btwPanelController.clear();
+     this.state.footer.setBackgroundCounts({ bashTasks: 0, agentTasks: 0 });
+diff --git a/apps/kimi-code/src/tui/tui-state.ts b/apps/kimi-code/src/tui/tui-state.ts
+index 601079f928a5c25272c815abebd572f7e5c1e608..bb618b5f02ea0fb7f06130059dbe7434e2fe6e16 100644
+--- a/apps/kimi-code/src/tui/tui-state.ts
++++ b/apps/kimi-code/src/tui/tui-state.ts
+@@ -44,6 +44,8 @@ export interface TUIState {
+   terminal: ProcessTerminal;
+   transcriptContainer: GutterContainer;
+   activityContainer: Container;
++  /** Agent rows under the conversation (AgentDockComponent). */
++  agentDockContainer: Container;
+   todoPanelContainer: Container;
+   todoPanel: TodoPanelComponent;
+   notifyPanelContainer: Container;
+@@ -136,6 +138,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
+ 
+   const transcriptContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+   const activityContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
++  const agentDockContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+   const todoPanelContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+   const todoPanel = new TodoPanelComponent();
+   const notifyPanelContainer = new GutterContainer(CHROME_GUTTER, CHROME_GUTTER);
+@@ -163,6 +166,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
+     const transcriptView = new TranscriptView(transcriptContainer);
+     dockContainer = new VStack();
+     dockContainer.addChild(activityContainer, { shrink: 1, minSize: 0 });
++    dockContainer.addChild(agentDockContainer, { shrink: 1, minSize: 0 });
+     dockContainer.addChild(todoPanelContainer, { shrink: 1, minSize: 0 });
+     dockContainer.addChild(notifyPanelContainer, { shrink: 1, minSize: 0 });
+     dockContainer.addChild(queueContainer, { shrink: 1, minSize: 0 });
+@@ -183,6 +187,7 @@ export function createTUIState(options: KimiTUIOptions): TUIState {
+     terminal,
+     transcriptContainer,
+     activityContainer,
++    agentDockContainer,
+     todoPanelContainer,
+     todoPanel,
+     notifyPanelContainer,
+diff --git a/apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts b/apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..085152ca361e592562545facca38a7b32a2dae90
+--- /dev/null
++++ b/apps/kimi-code/test/tui/components/chrome/agent-dock.test.ts
+@@ -0,0 +1,214 @@
++import { describe, expect, it, vi } from 'vitest';
++
++import {
++  AgentDockComponent,
++  COMPLETED_LINGER_MS,
++  FAILED_LINGER_MS,
++  type AgentDockRow,
++} from '#/tui/components/chrome/agent-dock';
++import { STATUS_BULLET } from '#/tui/constant/symbols';
++import type { SubagentActivityRecord } from '#/tui/controllers/subagent-activity-store';
++import { currentTheme } from '#/tui/theme';
++
++const ANSI = /\u001b\[[0-9;]*m/g;
++const plain = (lines: string[]): string[] => lines.map((line) => line.replace(ANSI, ''));
++
++function record(agentId: string, overrides: Partial<SubagentActivityRecord> = {}): SubagentActivityRecord {
++  return {
++    agentId,
++    agentName: `agent-${agentId}`,
++    description: undefined,
++    parentToolCallId: `tc-${agentId}`,
++    model: 'openai/gpt-6-astra',
++    effort: 'high',
++    steps: [],
++    totalSteps: 0,
++    status: 'running',
++    version: 0,
++    ...overrides,
++  };
++}
++
++function setup(now = { t: 1_000 }) {
++  const opened: AgentDockRow[] = [];
++  let left = 0;
++  const dock = new AgentDockComponent({
++    onOpen: (row) => {
++      opened.push(row);
++    },
++    onLeave: () => {
++      left += 1;
++    },
++    requestRender: () => {},
++    now: () => now.t,
++  });
++  return { dock, opened, leftCount: () => left, now };
++}
++
++describe('AgentDockComponent', () => {
++  it('renders nothing without agents and a row per agent with a running dot', () => {
++    vi.useFakeTimers();
++    try {
++      const { dock } = setup();
++      expect(dock.render(80)).toEqual([]);
++
++      dock.upsert(record('a', { description: 'Audit the first layer' }));
++      dock.upsert(
++        record('b', {
++          steps: [
++            {
++              step: 1,
++              textTail: '',
++              toolCalls: [
++                { id: 't1', name: 'Read', args: { path: 'src/x.ts' }, status: 'running', startedAt: 0 },
++              ],
++            },
++          ],
++        }),
++      );
++      const lines = plain(dock.render(120));
++      expect(lines[0]).toBe('');
++      expect(lines[1]).toContain(`${STATUS_BULLET}agent-a · Audit the first layer · openai/gpt-6-astra · high · 0s`);
++      expect(lines[2]).toContain(`${STATUS_BULLET}agent-b · openai/gpt-6-astra · high · 1 tools · 0s · Read src/x.ts`);
++      expect(lines[3]).toContain('↓ agents');
++      dock.dispose();
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('turns the dot green on completion, red on failure, and drops rows after they linger', () => {
++    vi.useFakeTimers();
++    try {
++      const { dock, now } = setup();
++      const done = record('done');
++      const failed = record('failed');
++      dock.upsert(done);
++      dock.upsert(failed);
++
++      done.status = 'completed';
++      failed.status = 'failed';
++      dock.upsert(done);
++      dock.upsert(failed);
++      const lines = dock.render(120);
++      expect(lines[1]).toContain(currentTheme.fg('success', STATUS_BULLET));
++      expect(plain([lines[1]!])[0]).toContain('· done');
++      expect(lines[2]).toContain(currentTheme.fg('error', STATUS_BULLET));
++      expect(plain([lines[2]!])[0]).toContain('· failed');
++
++      now.t += COMPLETED_LINGER_MS;
++      dock.expire();
++      expect(plain(dock.render(120)).filter((l) => l.includes(STATUS_BULLET))).toHaveLength(1);
++
++      now.t += FAILED_LINGER_MS;
++      dock.expire();
++      expect(dock.render(120)).toEqual([]);
++      expect(dock.isEmpty()).toBe(true);
++      dock.dispose();
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('moves the selection with the arrows, opens on Enter and leaves on Esc or past the last row', () => {
++    vi.useFakeTimers();
++    try {
++      const { dock, opened, leftCount } = setup();
++      dock.upsert(record('a'));
++      dock.upsert(record('b'));
++
++      expect(dock.focus()).toBe(true);
++      expect(plain(dock.render(120))[1]).toMatch(/^❯ /);
++      expect(plain(dock.render(120))[3]).toContain('Enter');
++
++      dock.handleInput('\u001b[B'); // down
++      expect(plain(dock.render(120))[2]).toMatch(/^❯ /);
++      dock.handleInput('\r'); // enter
++      expect(opened.map((row) => row.agentId)).toEqual(['b']);
++
++      dock.handleInput('\u001b[A'); // up
++      expect(dock.selectedRow()?.agentId).toBe('a');
++      dock.handleInput('\u001b'); // esc
++      expect(leftCount()).toBe(1);
++      expect(dock.focused).toBe(false);
++
++      dock.focus();
++      dock.handleInput('\u001b[B');
++      dock.handleInput('\u001b[B'); // past the last row
++      expect(leftCount()).toBe(2);
++      expect(dock.focused).toBe(false);
++      dock.dispose();
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('keeps the selected finished row while focused and marks dropped running agents as ended', () => {
++    vi.useFakeTimers();
++    try {
++      const { dock, now } = setup();
++      const a = record('a');
++      dock.upsert(a);
++      dock.upsert(record('b'));
++      dock.focus();
++
++      a.status = 'completed';
++      dock.upsert(a);
++      now.t += COMPLETED_LINGER_MS * 2;
++      dock.expire();
++      expect(dock.has('a')).toBe(true);
++
++      dock.markDropped('b');
++      const lines = plain(dock.render(120));
++      expect(lines[2]).toContain('· ended');
++
++      dock.blur();
++      dock.expire();
++      expect(dock.has('a')).toBe(false);
++      dock.dispose();
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('while viewing, the arrows switch the shown agent and Enter or Esc go back to the chat', () => {
++    vi.useFakeTimers();
++    try {
++      const selected: string[] = [];
++      let back = 0;
++      const dock = new AgentDockComponent({
++        onOpen: () => {},
++        onSelect: (row) => {
++          selected.push(row.agentId);
++        },
++        onBack: () => {
++          back += 1;
++        },
++        onLeave: () => {},
++        requestRender: () => {},
++      });
++      dock.upsert(record('a'));
++      dock.upsert(record('b'));
++      dock.focus();
++      dock.viewing = true;
++      expect(plain(dock.render(120))[3]).toContain('back to chat');
++
++      dock.handleInput('\u001b[B');
++      dock.handleInput('\u001b[B'); // stays on the last row while viewing
++      expect(selected).toEqual(['b']);
++      expect(dock.focused).toBe(true);
++      dock.handleInput('\r');
++      dock.handleInput('\u001b');
++      expect(back).toBe(2);
++      dock.dispose();
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it('cannot focus when empty', () => {
++    const { dock } = setup();
++    expect(dock.focus()).toBe(false);
++    expect(dock.focused).toBe(false);
++  });
++});
+diff --git a/apps/kimi-code/test/tui/components/messages/agent-conversation.test.ts b/apps/kimi-code/test/tui/components/messages/agent-conversation.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..29f8c8bfd4afb37c78762670226901f1e789aa51
+--- /dev/null
++++ b/apps/kimi-code/test/tui/components/messages/agent-conversation.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from 'vitest';
++
++import { AgentConversationComponent } from '#/tui/components/messages/agent-conversation';
++import { USER_MESSAGE_BULLET } from '#/tui/constant/symbols';
++import type { SubagentActivityRecord } from '#/tui/controllers/subagent-activity-store';
++
++const ANSI = /\u001b\[[0-9;]*m/g;
++const plain = (lines: string[]): string => lines.map((line) => line.replace(ANSI, '')).join('\n');
++
++function record(overrides: Partial<SubagentActivityRecord> = {}): SubagentActivityRecord {
++  return {
++    agentId: 'a1',
++    agentName: 'coder',
++    description: 'lister',
++    prompt: 'List the files in src and count them.',
++    parentToolCallId: 'tc-1',
++    model: 'openai/gpt-6-astra',
++    effort: 'high',
++    steps: [
++      {
++        step: 1,
++        textTail: 'Let me look at the directory.',
++        toolCalls: [
++          {
++            id: 't1',
++            name: 'Bash',
++            args: { command: 'ls src' },
++            status: 'done',
++            startedAt: 0,
++            durationMs: 12,
++            result: { tool_call_id: 't1', output: 'a.ts\nb.ts', is_error: false },
++          },
++        ],
++      },
++    ],
++    totalSteps: 1,
++    status: 'running',
++    version: 3,
++    ...overrides,
++  };
++}
++
++describe('AgentConversationComponent', () => {
++  it('shows the task prompt as a user message, then the assistant text and tool calls', () => {
++    const text = plain(new AgentConversationComponent(record(), { tick: () => 2 }).render(100));
++    expect(text).toContain('agent coder › lister · openai/gpt-6-astra · high');
++    expect(text).toContain(`${USER_MESSAGE_BULLET}List the files in src and count them.`);
++    expect(text).toContain('Let me look at the directory.');
++    expect(text).toContain('Used Bash');
++    expect(text).toContain('coder is working…');
++  });
++
++  it('falls back to the description without a prompt and shows the result when finished', () => {
++    const done = record({
++      prompt: undefined,
++      status: 'completed',
++      resultSummary: 'There are 2 files.',
++    });
++    const text = plain(new AgentConversationComponent(done).render(100));
++    expect(text).toContain(`${USER_MESSAGE_BULLET}lister`);
++    expect(text).toContain('✓ coder finished');
++    expect(text).toContain('There are 2 files.');
++    expect(text).not.toContain('is working');
++  });
++
++  it('shows the failure and re-renders when the record version moves', () => {
++    const rec = record({ status: 'failed', error: 'boom' });
++    const component = new AgentConversationComponent(rec);
++    expect(plain(component.render(100))).toContain('✗ coder failed');
++    const before = component.render(100);
++    expect(component.render(100)).toBe(before);
++    rec.steps[0]!.textTail = 'Changed text.';
++    rec.version += 1;
++    expect(plain(component.render(100))).toContain('Changed text.');
++  });
++});
+diff --git a/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts b/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
+index 06b90dd6941759d20b6b44bc08601a89cbaa2894..e4e17fc12b6af4e5a490464b3448473aaf4013f8 100644
+--- a/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
++++ b/apps/kimi-code/test/tui/controllers/subagent-activity-store.test.ts
+@@ -310,4 +310,32 @@ describe('SubagentActivityStore', () => {
+     store.markCompleted('agent-1', 'done');
+     expect(buffers.has('agent-1:t-trunc')).toBe(false);
+   });
++
++  it('notifies subscribers of record updates, drops and clears until unsubscribed', () => {
++    const store = new SubagentActivityStore();
++    const changes: string[] = [];
++    const unsubscribe = store.subscribe((change) => {
++      changes.push(change.kind === 'clear' ? 'clear' : `${change.kind}:${change.agentId}`);
++    });
++
++    store.ensureRecord(spawn());
++    store.applyEvent(ev({ type: 'turn.step.started', turnId: 1, step: 0 }));
++    store.markCompleted('agent-1', 'done');
++    store.drop('agent-1');
++    store.drop('agent-1'); // nothing left to drop: no notification
++    store.ensureRecord(spawn({ agentId: 'agent-2' }));
++    store.clear();
++    expect(changes).toEqual([
++      'update:agent-1',
++      'update:agent-1',
++      'update:agent-1',
++      'drop:agent-1',
++      'update:agent-2',
++      'clear',
++    ]);
++
++    unsubscribe();
++    store.ensureRecord(spawn());
++    expect(changes).toHaveLength(6);
++  });
+ });
+-- 
+2.50.1 (Apple Git-155)
+

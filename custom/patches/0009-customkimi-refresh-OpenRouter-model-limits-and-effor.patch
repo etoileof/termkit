@@ -1,0 +1,1318 @@
+From 76c96946268cbfdf78e34cd1c0fc5a7115209610 Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Thu, 22 Oct 2026 16:04:23 +0200
+Subject: [PATCH 09/13] customkimi: refresh OpenRouter model limits and efforts
+ at startup
+
+Aliases whose endpoint is https://openrouter.ai/api/v1 take context and output limits and reasoning efforts from OpenRouter's public model list (no key sent), using the CloseRouter refresh rules. Runs as branch 1.6 of refreshProviderModels.
+---
+ packages/oauth/src/closerouter.ts           |  30 +-
+ packages/oauth/src/openrouter.ts            | 334 +++++++++
+ packages/oauth/src/refreshProviderModels.ts |  49 +-
+ packages/oauth/test/openrouter.test.ts      | 729 ++++++++++++++++++++
+ 4 files changed, 1116 insertions(+), 26 deletions(-)
+ create mode 100644 packages/oauth/src/openrouter.ts
+ create mode 100644 packages/oauth/test/openrouter.test.ts
+
+diff --git a/packages/oauth/src/closerouter.ts b/packages/oauth/src/closerouter.ts
+index 7b3b21e76195002e4091584b887f7c5f435bfee5..0d806003dd0d34b6643425152bda44cefa8540c1 100644
+--- a/packages/oauth/src/closerouter.ts
++++ b/packages/oauth/src/closerouter.ts
+@@ -38,7 +38,7 @@ const DEFAULT_CONCURRENCY = 4;
+ 
+ export type CloseRouterEndpointType = 'chat' | 'responses' | 'messages';
+ 
+-const ENDPOINT_TYPE_BY_PROTOCOL: Readonly<Record<string, CloseRouterEndpointType>> = {
++export const ENDPOINT_TYPE_BY_PROTOCOL: Readonly<Record<string, CloseRouterEndpointType>> = {
+   openai: 'chat',
+   openai_responses: 'responses',
+   anthropic: 'messages',
+@@ -56,7 +56,7 @@ const ENV_TABLE_API_KEY: Readonly<Record<string, string>> = {
+   openai_responses: 'OPENAI_API_KEY',
+   anthropic: 'ANTHROPIC_API_KEY',
+ };
+-const ENV_TABLE_BASE_URL: Readonly<Record<string, string>> = {
++export const ENV_TABLE_BASE_URL: Readonly<Record<string, string>> = {
+   openai: 'OPENAI_BASE_URL',
+   openai_responses: 'OPENAI_BASE_URL',
+   anthropic: 'ANTHROPIC_BASE_URL',
+@@ -69,7 +69,7 @@ const EFFORT_RANK = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+ const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+ const SERVICE_TIER_SUFFIX = /:(?:flex|default|priority)$/;
+ /** Entries the engine synthesizes from `KIMI_MODEL_*` variables; they never persist. */
+-const ENV_OVERLAY_PREFIX = '__kimi_env';
++export const ENV_OVERLAY_PREFIX = '__kimi_env';
+ 
+ export interface CloseRouterRefreshHost {
+   getConfig(): Promise<ManagedKimiConfigShape>;
+@@ -127,11 +127,11 @@ interface GroupMetadata {
+   readonly endpoints: ReadonlyMap<string, EndpointList>;
+ }
+ 
+-interface AliasMetadata extends ModelLimits {
++export interface AliasMetadata extends ModelLimits {
+   readonly efforts?: readonly string[];
+ }
+ 
+-class FailureLog {
++export class FailureLog {
+   private readonly entries: Array<{ provider: string; reason: string }> = [];
+   private readonly seen = new Set<string>();
+ 
+@@ -281,7 +281,7 @@ function closeRouterTargets(
+   return targets;
+ }
+ 
+-function readAlias(config: ManagedKimiConfigShape, alias: string): Record<string, unknown> {
++export function readAlias(config: ManagedKimiConfigShape, alias: string): Record<string, unknown> {
+   const model = config.models?.[alias];
+   return isRecord(model) ? model : {};
+ }
+@@ -537,7 +537,7 @@ function effortsForTarget(
+ }
+ 
+ /** Missing or null means the endpoint takes no effort; anything else must be a list of effort names. */
+-function parseEfforts(value: unknown): readonly string[] | undefined {
++export function parseEfforts(value: unknown): readonly string[] | undefined {
+   if (value === undefined || value === null) return [];
+   if (!Array.isArray(value)) return undefined;
+   const efforts: string[] = [];
+@@ -560,7 +560,7 @@ function parseEfforts(value: unknown): readonly string[] | undefined {
+  * thinking block, and whether a model can turn reasoning off at all comes from
+  * its model profile at runtime, never from a missing `none` effort.
+  */
+-function patchAlias(
++export function patchAlias(
+   current: Record<string, unknown>,
+   endpointType: CloseRouterEndpointType,
+   metadata: AliasMetadata,
+@@ -596,12 +596,12 @@ function patchAlias(
+  * changed. The patched alias declares its thinking metadata in full, so the
+  * check below matches the engine's validation for it.
+  */
+-interface SubagentEffort {
++export interface SubagentEffort {
+   readonly effort: string;
+   readonly aliases: ReadonlySet<string>;
+ }
+ 
+-function secondaryModelEffort(config: ManagedKimiConfigShape): SubagentEffort | undefined {
++export function secondaryModelEffort(config: ManagedKimiConfigShape): SubagentEffort | undefined {
+   const section = config['secondaryModel'];
+   if (!isRecord(section)) return undefined;
+   const effort = nonEmptyString(section['defaultEffort'])?.toLowerCase();
+@@ -627,7 +627,7 @@ function subagentEffortConflict(
+   return `[secondary_model] default_effort "${subagent.effort}" would no longer work with ${alias}: ${problem}. Change default_effort to apply CloseRouter's efforts; keeping its previous efforts.`;
+ }
+ 
+-function subagentEffortProblem(effort: string, alias: Record<string, unknown>): string | undefined {
++export function subagentEffortProblem(effort: string, alias: Record<string, unknown>): string | undefined {
+   const overrides = isRecord(alias['overrides']) ? alias['overrides'] : {};
+   const capabilities = new Set(
+     capabilityList(overrides['capabilities'] ?? alias['capabilities']).map((capability) =>
+@@ -648,7 +648,7 @@ function subagentEffortProblem(effort: string, alias: Record<string, unknown>):
+   return `it supports ${efforts.join(', ')}`;
+ }
+ 
+-function thinkingFields(alias: Record<string, unknown>): unknown[] {
++export function thinkingFields(alias: Record<string, unknown>): unknown[] {
+   return [
+     capabilityList(alias['capabilities'])
+       .map((capability) => capability.trim().toLowerCase())
+@@ -664,7 +664,7 @@ function capabilityList(value: unknown): string[] {
+   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+ }
+ 
+-function sameAlias(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
++export function sameAlias(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+   return JSON.stringify(canonicalAlias(a)) === JSON.stringify(canonicalAlias(b));
+ }
+ 
+@@ -688,7 +688,7 @@ function catalogId(modelId: string): string {
+   return modelId.replace(SERVICE_TIER_SUFFIX, '');
+ }
+ 
+-function positiveInteger(value: unknown): number | undefined {
++export function positiveInteger(value: unknown): number | undefined {
+   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+ }
+ 
+@@ -752,7 +752,7 @@ async function mapWithConcurrency<T, R>(
+   return results;
+ }
+ 
+-function errorMessage(error: unknown): string {
++export function errorMessage(error: unknown): string {
+   if (!(error instanceof Error)) return String(error);
+   if (error.name === 'TimeoutError' || error.name === 'AbortError') return 'timed out';
+   // fetch reports DNS, TLS and refused redirects as "fetch failed" with the reason in `cause`.
+diff --git a/packages/oauth/src/openrouter.ts b/packages/oauth/src/openrouter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4072f739ab2337096b5c4566e730d09f762623d2
+--- /dev/null
++++ b/packages/oauth/src/openrouter.ts
+@@ -0,0 +1,334 @@
++import type { ManagedKimiConfigShape } from './managed-kimi-code';
++import { readApiErrorMessage } from './api-error';
++import {
++  ENDPOINT_TYPE_BY_PROTOCOL,
++  ENV_OVERLAY_PREFIX,
++  ENV_TABLE_BASE_URL,
++  FailureLog,
++  errorMessage,
++  parseEfforts,
++  patchAlias,
++  positiveInteger,
++  readAlias,
++  sameAlias,
++  secondaryModelEffort,
++  subagentEffortProblem,
++  thinkingFields,
++  type AliasMetadata,
++  type CloseRouterEndpointType,
++  type CloseRouterProviderChange,
++  type CloseRouterRefreshHost,
++  type CloseRouterRefreshResult,
++  type SubagentEffort,
++} from './closerouter';
++import { nonEmptyString } from './provider-credential';
++import { isRecord } from './utils';
++
++/**
++ * OpenRouter model metadata refresh.
++ *
++ * Configured aliases whose endpoint is OpenRouter get their limits
++ * (`context_length`, `top_provider.max_completion_tokens`) and reasoning
++ * efforts (`reasoning.supported_efforts`) from OpenRouter's public model
++ * catalog, `GET /api/v1/models`. The catalog needs no API key, so this refresh
++ * never sends one. Only aliases that already exist are updated; the catalog is
++ * never imported.
++ *
++ * The refreshed fields, the Chat / Responses thinking rules and the
++ * `[secondary_model]` effort check are CloseRouter's own helpers (see
++ * ./closerouter): `[models."<alias>".overrides]` are never touched.
++ * closerouter.ts only exports its helpers, so three parts of
++ * refreshCloseRouterModels() are mirrored here instead of shared: the target
++ * skip rules (openRouterTargets), the conflict message
++ * (subagentEffortConflict) and the re-read, merge and models-only write, which
++ * writes nothing when nothing changed. A fix to one belongs in both.
++ */
++
++const OPENROUTER_HOST = 'openrouter.ai';
++const OPENROUTER_API_BASE = `https://${OPENROUTER_HOST}/api/v1`;
++
++const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
++const DEFAULT_DEADLINE_MS = 30_000;
++
++/** Routing variants (`:nitro`, `:floor`, `:online`, …) share their base model's metadata. */
++const VARIANT_SUFFIX = /:[^/:]+$/;
++
++export type OpenRouterRefreshResult = CloseRouterRefreshResult;
++
++export interface OpenRouterRefreshOptions {
++  /** Refresh only the aliases of this provider. */
++  readonly providerId?: string;
++  /** Upper bound for the wait for the catalog response, until its headers arrive. */
++  readonly requestTimeoutMs?: number;
++  /** Upper bound for the whole catalog request, body included. */
++  readonly deadlineMs?: number;
++  readonly fetchImpl?: typeof fetch;
++}
++
++interface OpenRouterTarget {
++  readonly alias: string;
++  readonly providerId: string;
++  readonly modelId: string;
++  readonly endpointType: CloseRouterEndpointType;
++}
++
++type Catalog = ReadonlyMap<string, Record<string, unknown>>;
++
++/**
++ * Normalizes a configured base URL to OpenRouter's API base, or returns
++ * undefined when it is not exactly `https://openrouter.ai/api/v1` (an optional
++ * trailing slash aside): plain HTTP, a port, credentials, a query or another
++ * path or host are rejected.
++ */
++export function openRouterApiBase(baseUrl: unknown): string | undefined {
++  const value = nonEmptyString(baseUrl);
++  if (value === undefined) return undefined;
++  let url: URL;
++  try {
++    url = new URL(value);
++  } catch {
++    return undefined;
++  }
++  if (url.protocol !== 'https:' || url.hostname !== OPENROUTER_HOST) return undefined;
++  if (url.port !== '' || url.username !== '' || url.password !== '') return undefined;
++  if (url.search !== '' || url.hash !== '') return undefined;
++  return /^\/api\/v1\/?$/.test(url.pathname) ? OPENROUTER_API_BASE : undefined;
++}
++
++export async function refreshOpenRouterModels(
++  host: CloseRouterRefreshHost,
++  config: ManagedKimiConfigShape,
++  options: OpenRouterRefreshOptions = {},
++): Promise<OpenRouterRefreshResult> {
++  const targets = openRouterTargets(config, options.providerId);
++  if (targets.length === 0) return { config, changed: [], unchanged: [], failed: [] };
++
++  const failures = new FailureLog();
++  let catalog: Catalog;
++  try {
++    catalog = await fetchCatalog(host.userAgent, options);
++  } catch (error) {
++    failures.addFor(
++      targets,
++      `OpenRouter model catalog request failed (${errorMessage(error)}); keeping the previous limits and efforts.`,
++    );
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++
++  // Merge into the config as it is now, not as it was before the request:
++  // aliases edited, added or removed meanwhile are taken as they are. The
++  // catalog lists every model, so aliases added meanwhile are refreshed too.
++  let fresh: ManagedKimiConfigShape;
++  try {
++    fresh = await host.getConfig();
++  } catch (error) {
++    failures.addFor(targets, `Could not re-read the config after the OpenRouter request: ${errorMessage(error)}`);
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++  const next = structuredClone(fresh);
++  const subagentEffort = secondaryModelEffort(fresh);
++  const changed = new Map<string, CloseRouterProviderChange>();
++  const seen = new Set<string>();
++  for (const target of openRouterTargets(fresh, options.providerId)) {
++    seen.add(target.providerId);
++    const current = readAlias(fresh, target.alias);
++    const aliasMetadata = metadataForTarget(catalog, target, current, failures);
++    let patched = patchAlias(current, target.endpointType, aliasMetadata);
++    const conflict = subagentEffortConflict(subagentEffort, target.alias, current, patched);
++    if (conflict !== undefined) {
++      failures.add(target.providerId, conflict);
++      patched = patchAlias(current, target.endpointType, { ...aliasMetadata, efforts: undefined });
++    }
++    if (!sameAlias(current, patched)) {
++      next.models![target.alias] = patched;
++      const previous = changed.get(target.providerId);
++      changed.set(target.providerId, {
++        providerId: target.providerId,
++        aliases: (previous?.aliases ?? 0) + 1,
++        limits:
++          previous?.limits === true ||
++          current['maxContextSize'] !== patched['maxContextSize'] ||
++          current['maxOutputSize'] !== patched['maxOutputSize'],
++        efforts:
++          previous?.efforts === true ||
++          JSON.stringify(thinkingFields(current)) !== JSON.stringify(thinkingFields(patched)),
++      });
++    }
++  }
++
++  const failed = failures.list();
++  const unchanged = [...seen].filter(
++    (providerId) =>
++      !changed.has(providerId) && !failed.some((failure) => failure.provider === providerId),
++  );
++  if (changed.size === 0) return { config: fresh, changed: [], unchanged, failed };
++  try {
++    // Only the models section is written; every host leaves sections absent
++    // from the patch untouched, so concurrent provider edits survive.
++    const written = await host.setConfig({ models: next.models } as ManagedKimiConfigShape);
++    return { config: written, changed: [...changed.values()], unchanged, failed };
++  } catch (error) {
++    for (const providerId of changed.keys()) {
++      failures.add(providerId, `Could not save the refreshed OpenRouter metadata: ${errorMessage(error)}`);
++    }
++    return { config: fresh, changed: [], unchanged, failed: failures.list() };
++  }
++}
++
++function openRouterTargets(
++  config: ManagedKimiConfigShape,
++  providerId: string | undefined,
++): OpenRouterTarget[] {
++  const targets: OpenRouterTarget[] = [];
++  for (const [alias, model] of Object.entries(config.models ?? {})) {
++    if (!isRecord(model) || alias.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    const owner = nonEmptyString(model['provider']);
++    if (owner === undefined || owner.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    if (providerId !== undefined && owner !== providerId) continue;
++    const provider = config.providers[owner];
++    if (!isRecord(provider)) continue;
++    // The same opt-outs as CloseRouter: `model_source = "static"`, and
++    // registry- and OAuth-managed providers and models.
++    if (provider['modelSource'] === 'static') continue;
++    if (provider['source'] !== undefined || provider['oauth'] !== undefined) continue;
++    if (model['oauth'] !== undefined) continue;
++    // OpenRouter is called through the OpenAI Chat or Responses API only.
++    const protocol = model['protocol'] ?? provider['type'];
++    const endpointType =
++      typeof protocol === 'string' ? ENDPOINT_TYPE_BY_PROTOCOL[protocol] : undefined;
++    if (endpointType === undefined || endpointType === 'messages') continue;
++    // The runtime's precedence: the model's `base_url`, else the provider's,
++    // else the base URL in the provider's `env` table for its type.
++    const type = provider['type'] ?? model['protocol'];
++    const env = provider['env'];
++    const baseUrl =
++      nonEmptyString(model['baseUrl']) ??
++      nonEmptyString(provider['baseUrl']) ??
++      (isRecord(env) && typeof type === 'string' ? nonEmptyString(env[ENV_TABLE_BASE_URL[type] ?? '']) : undefined);
++    if (openRouterApiBase(baseUrl) === undefined) continue;
++    const modelId = nonEmptyString(model['name']) ?? nonEmptyString(model['model']);
++    if (modelId === undefined) continue;
++    targets.push({ alias, providerId: owner, modelId, endpointType });
++  }
++  return targets;
++}
++
++function metadataForTarget(
++  catalog: Catalog,
++  target: OpenRouterTarget,
++  current: Record<string, unknown>,
++  failures: FailureLog,
++): AliasMetadata {
++  const entry = catalog.get(target.modelId) ?? catalog.get(target.modelId.replace(VARIANT_SUFFIX, ''));
++  if (entry === undefined) {
++    failures.add(
++      target.providerId,
++      `${target.modelId} is not in the OpenRouter catalog; keeping its previous limits and efforts.`,
++    );
++    return {};
++  }
++  const maxContextSize = positiveInteger(entry['context_length']);
++  if (maxContextSize === undefined) {
++    failures.add(
++      target.providerId,
++      `OpenRouter reports no valid context_length for ${target.modelId}; keeping its previous context size.`,
++    );
++  }
++  const topProvider = entry['top_provider'];
++  return {
++    maxContextSize,
++    maxOutputSize: isRecord(topProvider) ? positiveInteger(topProvider['max_completion_tokens']) : undefined,
++    efforts: effortsForTarget(entry, target, current, failures),
++  };
++}
++
++/**
++ * A model without a `reasoning.supported_efforts` list is treated like a
++ * CloseRouter endpoint that lists no effort levels: its previous efforts stay.
++ */
++function effortsForTarget(
++  entry: Record<string, unknown>,
++  target: OpenRouterTarget,
++  current: Record<string, unknown>,
++  failures: FailureLog,
++): readonly string[] | undefined {
++  const reasoning = isRecord(entry['reasoning']) ? entry['reasoning'] : {};
++  const listed = reasoning['supported_efforts'];
++  const parsed = parseEfforts(Array.isArray(listed) ? listed : undefined);
++  if (parsed === undefined) {
++    failures.add(
++      target.providerId,
++      `OpenRouter returned invalid reasoning.supported_efforts for ${target.modelId}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  // Mandatory reasoning cannot be turned off, whatever the list says.
++  const efforts = reasoning['mandatory'] === true ? parsed.filter((effort) => effort !== 'none') : parsed;
++  if (efforts.every((effort) => effort === 'none') && Array.isArray(current['supportEfforts'])) {
++    failures.add(
++      target.providerId,
++      `OpenRouter lists no reasoning effort levels for ${target.modelId}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  return efforts;
++}
++
++function subagentEffortConflict(
++  subagent: SubagentEffort | undefined,
++  alias: string,
++  current: Record<string, unknown>,
++  patched: Record<string, unknown>,
++): string | undefined {
++  if (subagent === undefined || !subagent.aliases.has(alias)) return undefined;
++  if (JSON.stringify(thinkingFields(current)) === JSON.stringify(thinkingFields(patched))) {
++    return undefined;
++  }
++  const problem = subagentEffortProblem(subagent.effort, patched);
++  if (problem === undefined) return undefined;
++  return `[secondary_model] default_effort "${subagent.effort}" would no longer work with ${alias}: ${problem}. Change default_effort to apply OpenRouter's efforts; keeping its previous efforts.`;
++}
++
++async function fetchCatalog(userAgent: string | undefined, options: OpenRouterRefreshOptions): Promise<Catalog> {
++  // The catalog is public: no Authorization header, so no key can leak here.
++  const headers: Record<string, string> = { Accept: 'application/json' };
++  if (userAgent !== undefined) headers['User-Agent'] = userAgent;
++  const fetchImpl = options.fetchImpl ?? fetch;
++  // The request timeout bounds the wait for the response; reading the large
++  // catalog body may then take until the deadline.
++  const responseTimeout = new AbortController();
++  const timer = setTimeout(() => {
++    responseTimeout.abort(new DOMException('The catalog request timed out.', 'TimeoutError'));
++  }, options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
++  let response: Response;
++  try {
++    response = await fetchImpl(`${OPENROUTER_API_BASE}/models`, {
++      headers,
++      // Requests go to openrouter.ai only, never wherever a redirect points.
++      redirect: 'error',
++      signal: AbortSignal.any([
++        AbortSignal.timeout(options.deadlineMs ?? DEFAULT_DEADLINE_MS),
++        responseTimeout.signal,
++      ]),
++    });
++  } finally {
++    clearTimeout(timer);
++  }
++  if (!response.ok) {
++    throw new Error(await readApiErrorMessage(response, `HTTP ${response.status}`));
++  }
++  const text = await response.text();
++  let body: unknown;
++  try {
++    body = JSON.parse(text) as unknown;
++  } catch {
++    throw new Error('the response is not valid JSON');
++  }
++  const entries = isRecord(body) && Array.isArray(body['data']) ? body['data'] : undefined;
++  if (entries === undefined) throw new Error('the response has no data list');
++  const catalog = new Map<string, Record<string, unknown>>();
++  for (const entry of entries) {
++    if (isRecord(entry) && typeof entry['id'] === 'string') catalog.set(entry['id'], entry);
++  }
++  return catalog;
++}
+diff --git a/packages/oauth/src/refreshProviderModels.ts b/packages/oauth/src/refreshProviderModels.ts
+index 924cb4c344429ec31f91f59d1f364ba55924fad2..cc1656de7064d1ca26a42ad39497459c9ad2b8b8 100644
+--- a/packages/oauth/src/refreshProviderModels.ts
++++ b/packages/oauth/src/refreshProviderModels.ts
+@@ -1,4 +1,4 @@
+-import { refreshCloseRouterModels } from './closerouter';
++import { refreshCloseRouterModels, type CloseRouterProviderChange } from './closerouter';
+ import {
+   applyCustomRegistryProvider,
+   declaredUpgradeTarget,
+@@ -29,6 +29,7 @@ import {
+   getOpenPlatformById,
+   isOpenPlatformId,
+ } from './open-platform';
++import { refreshOpenRouterModels } from './openrouter';
+ import {
+   declaredProviderCredential,
+   apiKeyEnvMissingMessage,
+@@ -420,6 +421,21 @@ function pickDefaultModel(
+   return firstModel.id;
+ }
+ 
++/** A metadata-only refresh (CloseRouter, OpenRouter) reported as a change that names what it updated. */
++function metadataChange(
++  { providerId, aliases, limits, efforts }: CloseRouterProviderChange,
++  source: string,
++): ProviderChange {
++  const what = limits && efforts ? 'limits and efforts' : efforts ? 'efforts' : 'limits';
++  return {
++    providerId,
++    providerName: providerId,
++    added: 0,
++    removed: 0,
++    detail: `${what} of ${String(aliases)} model${aliases === 1 ? '' : 's'} updated from ${source}`,
++  };
++}
++
+ /**
+  * Refresh remote model metadata for the configured providers and persist any
+  * changes through the host. Handles four provider kinds, in order:
+@@ -427,6 +443,9 @@ function pickDefaultModel(
+  *  1. Managed Kimi Code (OAuth) — `GET /models` against the runtime endpoint.
+  *  1.5. CloseRouter — limits and endpoint efforts of the configured aliases
+  *     whose endpoint is CloseRouter; never adds or removes aliases.
++ *  1.6. OpenRouter — limits and efforts of the configured aliases whose
++ *     endpoint is OpenRouter, from its public catalog; never adds or removes
++ *     aliases.
+  *  2. Open platforms (moonshot-cn, moonshot-ai, …) — platform catalog fetch.
+  *  2.5. Managed-endpoint API-key providers — hand-written `type: 'kimi'`
+  *     providers (including a hand-written `managed:kimi-code` without an oauth
+@@ -548,16 +567,7 @@ export async function refreshProviderModels(
+   try {
+     const closeRouter = await refreshCloseRouterModels(host, config, { providerId: targetId });
+     config = closeRouter.config;
+-    for (const { providerId, aliases, limits, efforts } of closeRouter.changed) {
+-      const what = limits && efforts ? 'limits and efforts' : efforts ? 'efforts' : 'limits';
+-      changed.push({
+-        providerId,
+-        providerName: providerId,
+-        added: 0,
+-        removed: 0,
+-        detail: `${what} of ${String(aliases)} model${aliases === 1 ? '' : 's'} updated from CloseRouter`,
+-      });
+-    }
++    changed.push(...closeRouter.changed.map((change) => metadataChange(change, 'CloseRouter')));
+     unchanged.push(...closeRouter.unchanged);
+     failed.push(...closeRouter.failed);
+   } catch (error) {
+@@ -567,6 +577,23 @@ export async function refreshProviderModels(
+     });
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // 1.6. OpenRouter (CustomKIMI): limits and efforts of the configured aliases
++  //      from the public catalog, never the whole catalog (see ./openrouter).
++  // ---------------------------------------------------------------------------
++  try {
++    const openRouter = await refreshOpenRouterModels(host, config, { providerId: targetId });
++    config = openRouter.config;
++    changed.push(...openRouter.changed.map((change) => metadataChange(change, 'OpenRouter')));
++    unchanged.push(...openRouter.unchanged);
++    failed.push(...openRouter.failed);
++  } catch (error) {
++    failed.push({
++      provider: targetId ?? 'openrouter',
++      reason: error instanceof Error ? error.message : String(error),
++    });
++  }
++
+   // ---------------------------------------------------------------------------
+   // 2. Open Platforms (moonshot-cn, moonshot-ai, …)
+   // ---------------------------------------------------------------------------
+diff --git a/packages/oauth/test/openrouter.test.ts b/packages/oauth/test/openrouter.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..84be14a25763c47a2c2bc8d218430c24857d4397
+--- /dev/null
++++ b/packages/oauth/test/openrouter.test.ts
+@@ -0,0 +1,729 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import type { ManagedKimiConfigShape } from '../src/managed-kimi-code';
++import { openRouterApiBase, refreshOpenRouterModels, type OpenRouterRefreshOptions } from '../src/openrouter';
++import { refreshProviderModels, type RefreshProviderHost } from '../src/refreshProviderModels';
++
++/** Set `error` to make the whole OpenRouter refresh throw inside refreshProviderModels(). */
++const openRouterFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
++
++vi.mock('../src/openrouter', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('../src/openrouter')>();
++  return {
++    ...actual,
++    refreshOpenRouterModels: async (...args: Parameters<typeof actual.refreshOpenRouterModels>) => {
++      if (openRouterFault.error !== undefined) throw openRouterFault.error;
++      return actual.refreshOpenRouterModels(...args);
++    },
++  };
++});
++
++const API = 'https://openrouter.ai/api/v1';
++const CATALOG_URL = `${API}/models`;
++const PROVIDER_KEY = 'or-provider-key';
++
++const MUSE = 'meta/muse-wonder';
++const OPTIONAL = 'example/optional-reasoner';
++const MANDATORY_NONE = 'example/mandatory-none';
++const PLAIN = 'example/plain';
++const TOGGLE = 'example/toggle';
++const FREE = 'example/free:free';
++
++/** The real catalog entry of the target model (verified 2026-10-22). */
++const MUSE_ENTRY = {
++  id: MUSE,
++  context_length: 1048576,
++  top_provider: { context_length: 1048576, max_completion_tokens: 943718 },
++  pricing: { prompt: '0.000004', completion: '0.00002' },
++  reasoning: {
++    mandatory: true,
++    supported_efforts: ['max', 'xhigh', 'high', 'medium', 'low', 'minimal'],
++    default_effort: 'medium',
++  },
++};
++
++const CATALOG = [
++  MUSE_ENTRY,
++  {
++    id: OPTIONAL,
++    context_length: 400000,
++    top_provider: { max_completion_tokens: 128000 },
++    reasoning: { mandatory: false, supported_efforts: ['high', 'none', 'low', 'medium'], default_effort: 'medium' },
++  },
++  {
++    id: MANDATORY_NONE,
++    context_length: 200000,
++    top_provider: { max_completion_tokens: 64000 },
++    reasoning: { mandatory: true, supported_efforts: ['none', 'low', 'high'] },
++  },
++  { id: PLAIN, context_length: 131072, top_provider: { max_completion_tokens: null }, reasoning: null },
++  { id: TOGGLE, context_length: 262144, top_provider: { max_completion_tokens: 32768 }, reasoning: { default_enabled: true, mandatory: false } },
++  { id: FREE, context_length: 32768, top_provider: { max_completion_tokens: 4096 }, reasoning: null },
++  { id: 'example/not-configured', context_length: 1, top_provider: { max_completion_tokens: 1 }, reasoning: null },
++];
++
++interface Call {
++  readonly url: string;
++  readonly init: RequestInit;
++}
++
++function recordingFetch(respond: () => Response | Promise<Response> = () => Response.json({ data: CATALOG })): {
++  readonly calls: Call[];
++  readonly fetchImpl: typeof fetch;
++} {
++  const calls: Call[] = [];
++  const fetchImpl = (async (url: string, init: RequestInit) => {
++    calls.push({ url, init });
++    return respond();
++  }) as typeof fetch;
++  return { calls, fetchImpl };
++}
++
++function baseConfig(): ManagedKimiConfigShape {
++  return {
++    providers: {
++      openrouter: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', apiKey: PROVIDER_KEY },
++      'openrouter-responses': { type: 'openai_responses', baseUrl: 'https://openrouter.ai/api/v1/', apiKeyEnv: 'OPENROUTER_TEST_KEY' },
++      other: { type: 'openai', baseUrl: 'https://example.test/v1', apiKey: 'other-key' },
++    },
++    defaultModel: 'openrouter/muse',
++    thinking: { enabled: true, effort: 'high' },
++    models: {
++      'openrouter/muse': {
++        provider: 'openrouter',
++        model: MUSE,
++        maxContextSize: 1000000,
++        capabilities: ['image_in'],
++        overrides: { maxOutputSize: 32000 },
++      },
++      'openrouter-responses/optional': { provider: 'openrouter-responses', model: OPTIONAL, maxContextSize: 1 },
++      'other/model': { provider: 'other', model: 'other-model', maxContextSize: 1000 },
++    },
++  };
++}
++
++interface MemoryHost extends RefreshProviderHost {
++  readonly writes: ManagedKimiConfigShape[];
++  current(): ManagedKimiConfigShape;
++  edit(change: (config: ManagedKimiConfigShape) => void): void;
++}
++
++function memoryHost(initial: ManagedKimiConfigShape): MemoryHost {
++  let config = structuredClone(initial);
++  const writes: ManagedKimiConfigShape[] = [];
++  return {
++    writes,
++    current: () => config,
++    edit: (change) => {
++      change(config);
++    },
++    getConfig: async () => structuredClone(config),
++    setConfig: async (patch) => {
++      writes.push(structuredClone(patch));
++      const { models, ...rest } = structuredClone(patch);
++      config = { ...config, ...rest };
++      if (models !== undefined) {
++        // Like the real config writer: written aliases replace the section,
++        // but a key missing from a written alias keeps its stored value.
++        config.models = Object.fromEntries(
++          Object.entries(models).map(([alias, model]) => [
++            alias,
++            { ...(config.models?.[alias] as Record<string, unknown> | undefined), ...model },
++          ]),
++        );
++      }
++      return structuredClone(config);
++    },
++    removeProvider: async () => {
++      throw new Error('an OpenRouter refresh must never remove a provider');
++    },
++    resolveOAuthToken: async () => {
++      throw new Error('an OpenRouter refresh needs no OAuth token');
++    },
++    userAgent: 'kimi-code-cli/test',
++  };
++}
++
++function model(config: ManagedKimiConfigShape, alias: string): Record<string, unknown> {
++  return config.models![alias] as Record<string, unknown>;
++}
++
++async function refresh(
++  host: MemoryHost,
++  respond?: () => Response | Promise<Response>,
++  options: OpenRouterRefreshOptions = {},
++): Promise<Awaited<ReturnType<typeof refreshOpenRouterModels>> & { readonly calls: Call[] }> {
++  const { calls, fetchImpl } = recordingFetch(respond);
++  const result = await refreshOpenRouterModels(host, await host.getConfig(), { fetchImpl, ...options });
++  return { ...result, calls };
++}
++
++/**
++ * Answers at once, then streams the catalog after `delayMs` (never when it is
++ * undefined); the body fails when the request signal aborts, like fetch's.
++ */
++function slowBodyFetch(delayMs?: number): typeof fetch {
++  return ((_url: string, init: RequestInit) => {
++    const signal = init.signal!;
++    const body = new ReadableStream<Uint8Array>({
++      start(controller) {
++        signal.addEventListener(
++          'abort',
++          () => {
++            controller.error(signal.reason);
++          },
++          { once: true },
++        );
++        if (delayMs === undefined) return;
++        setTimeout(() => {
++          if (signal.aborted) return;
++          controller.enqueue(new TextEncoder().encode(JSON.stringify({ data: CATALOG })));
++          controller.close();
++        }, delayMs);
++      },
++    });
++    return Promise.resolve(new Response(body, { status: 200 }));
++  }) as typeof fetch;
++}
++
++afterEach(() => {
++  openRouterFault.error = undefined;
++  vi.unstubAllGlobals();
++  vi.unstubAllEnvs();
++});
++
++describe('openRouterApiBase', () => {
++  it.each(['https://openrouter.ai/api/v1', 'https://openrouter.ai/api/v1/', 'https://OpenRouter.ai/api/v1'])(
++    'accepts %s',
++    (baseUrl) => {
++      expect(openRouterApiBase(baseUrl)).toBe(API);
++    },
++  );
++
++  it.each([
++    'http://openrouter.ai/api/v1',
++    'https://openrouter.ai:8443/api/v1',
++    'https://user:secret@openrouter.ai/api/v1',
++    'https://openrouter.ai/api/v1?x=1',
++    'https://openrouter.ai/api/v1#x',
++    'https://openrouter.ai/api/v1/chat',
++    'https://openrouter.ai/api',
++    'https://openrouter.ai',
++    'https://www.openrouter.ai/api/v1',
++    'https://openrouter.ai.evil.test/api/v1',
++    'https://evil.test/openrouter.ai/api/v1',
++    'not a url',
++    '',
++    undefined,
++  ])('rejects %s', (baseUrl) => {
++    expect(openRouterApiBase(baseUrl)).toBeUndefined();
++  });
++});
++
++describe('OpenRouter metadata refresh', () => {
++  it('maps the real meta/muse-wonder entry and keeps unrelated capabilities and overrides', async () => {
++    const host = memoryHost(baseConfig());
++
++    const result = await refresh(host);
++
++    expect(result.failed).toEqual([]);
++    expect(model(host.current(), 'openrouter/muse')).toEqual({
++      provider: 'openrouter',
++      model: MUSE,
++      maxContextSize: 1048576,
++      maxOutputSize: 943718,
++      overrides: { maxOutputSize: 32000 },
++      supportEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
++      defaultEffort: 'high',
++      capabilities: ['image_in', 'thinking', 'always_thinking'],
++    });
++    expect(result.changed.toSorted((a, b) => a.providerId.localeCompare(b.providerId))).toEqual([
++      { providerId: 'openrouter', aliases: 1, limits: true, efforts: true },
++      { providerId: 'openrouter-responses', aliases: 1, limits: true, efforts: true },
++    ]);
++    const config = host.current();
++    expect(Object.keys(config.models!)).toEqual(Object.keys(baseConfig().models!));
++    expect(config.providers).toEqual(baseConfig().providers);
++    expect(config.defaultModel).toBe('openrouter/muse');
++    expect(config.thinking).toEqual({ enabled: true, effort: 'high' });
++    expect(model(config, 'other/model')).toEqual(model(baseConfig(), 'other/model'));
++    expect(host.writes).toHaveLength(1);
++    expect(Object.keys(host.writes[0]!)).toEqual(['models']);
++  });
++
++  it('sends one public catalog request with no API key, refusing redirects, to openrouter.ai only', async () => {
++    vi.stubEnv('OPENROUTER_TEST_KEY', 'or-env-key');
++    const host = memoryHost(baseConfig());
++
++    const { calls } = await refresh(host);
++
++    expect(calls).toHaveLength(1);
++    const [call] = calls;
++    expect(call!.url).toBe(CATALOG_URL);
++    const headers = new Headers(call!.init.headers);
++    expect(headers.has('authorization')).toBe(false);
++    expect(headers.get('user-agent')).toBe('kimi-code-cli/test');
++    expect(call!.init.redirect).toBe('error');
++    expect(call!.init.signal).toBeInstanceOf(AbortSignal);
++    expect(JSON.stringify([...headers])).not.toContain(PROVIDER_KEY);
++    expect(JSON.stringify([...headers])).not.toContain('or-env-key');
++  });
++
++  it('removes none from a mandatory reasoning list, so the alias always thinks', async () => {
++    const config = baseConfig();
++    config.models = { mandatory: { provider: 'openrouter', model: MANDATORY_NONE, maxContextSize: 1 } };
++    const host = memoryHost(config);
++
++    await refresh(host);
++
++    expect(model(host.current(), 'mandatory')).toEqual({
++      provider: 'openrouter',
++      model: MANDATORY_NONE,
++      maxContextSize: 200000,
++      maxOutputSize: 64000,
++      supportEfforts: ['low', 'high'],
++      defaultEffort: 'high',
++      capabilities: ['thinking', 'always_thinking'],
++    });
++  });
++
++  it('turns an optional reasoning list with none into an explicit off effort', async () => {
++    const host = memoryHost(baseConfig());
++
++    await refresh(host);
++
++    const optional = model(host.current(), 'openrouter-responses/optional');
++    expect(optional).toEqual({
++      provider: 'openrouter-responses',
++      model: OPTIONAL,
++      maxContextSize: 400000,
++      maxOutputSize: 128000,
++      supportEfforts: ['low', 'medium', 'high'],
++      defaultEffort: 'high',
++      offEffort: 'none',
++      capabilities: ['thinking'],
++    });
++  });
++
++  it("writes max_completion_tokens unclamped as a Responses alias's max_output_size", async () => {
++    // Responses requests send max_output_size as is (Chat clamps it), so a
++    // smaller cap for such an alias belongs in its overrides.
++    const config = baseConfig();
++    config.models = { muse: { provider: 'openrouter-responses', model: MUSE, maxContextSize: 1 } };
++    const host = memoryHost(config);
++
++    await refresh(host);
++
++    expect(model(host.current(), 'muse')).toMatchObject({ maxContextSize: 1048576, maxOutputSize: 943718 });
++  });
++
++  it('keeps previous efforts without reasoning efforts and reports only aliases that had some', async () => {
++    const config = baseConfig();
++    config.models = {
++      plain: { provider: 'openrouter', model: PLAIN, maxContextSize: 1, maxOutputSize: 2048 },
++      'plain-with-efforts': {
++        provider: 'openrouter',
++        model: PLAIN,
++        maxContextSize: 1,
++        supportEfforts: ['low', 'high'],
++        defaultEffort: 'high',
++        capabilities: ['thinking'],
++      },
++      toggle: { provider: 'openrouter', model: TOGGLE, maxContextSize: 1 },
++    };
++    const host = memoryHost(config);
++
++    const result = await refresh(host);
++
++    // max_completion_tokens: null leaves the previous output size silently.
++    expect(model(host.current(), 'plain')).toEqual({
++      provider: 'openrouter',
++      model: PLAIN,
++      maxContextSize: 131072,
++      maxOutputSize: 2048,
++    });
++    expect(model(host.current(), 'plain-with-efforts')).toEqual({
++      ...model(config, 'plain-with-efforts'),
++      maxContextSize: 131072,
++    });
++    expect(model(host.current(), 'toggle')).toEqual({
++      provider: 'openrouter',
++      model: TOGGLE,
++      maxContextSize: 262144,
++      maxOutputSize: 32768,
++    });
++    expect(result.failed).toEqual([
++      {
++        provider: 'openrouter',
++        reason: `OpenRouter lists no reasoning effort levels for ${PLAIN}; keeping its previous efforts.`,
++      },
++    ]);
++  });
++
++  it('reports a malformed effort list and keeps the previous efforts', async () => {
++    const config = baseConfig();
++    config.models = { muse: { provider: 'openrouter', model: MUSE, maxContextSize: 1 } };
++    const host = memoryHost(config);
++
++    const result = await refresh(host, () =>
++      Response.json({ data: [{ ...MUSE_ENTRY, reasoning: { mandatory: true, supported_efforts: ['high', 7] } }] }),
++    );
++
++    expect(model(host.current(), 'muse')).toEqual({
++      provider: 'openrouter',
++      model: MUSE,
++      maxContextSize: 1048576,
++      maxOutputSize: 943718,
++    });
++    expect(result.failed).toEqual([
++      { provider: 'openrouter', reason: expect.stringContaining(`invalid reasoning.supported_efforts for ${MUSE}`) },
++    ]);
++  });
++
++  it('reports models missing from the catalog and invalid context lengths while keeping their metadata', async () => {
++    const config = baseConfig();
++    config.models = {
++      missing: { provider: 'openrouter', model: 'example/missing', maxContextSize: 7 },
++      broken: { provider: 'openrouter', model: PLAIN, maxContextSize: 9 },
++    };
++    const host = memoryHost(config);
++
++    const result = await refresh(host, () =>
++      Response.json({ data: [{ id: PLAIN, context_length: 'large', top_provider: { max_completion_tokens: 4096 } }] }),
++    );
++
++    expect(model(host.current(), 'missing')).toEqual(model(config, 'missing'));
++    expect(model(host.current(), 'broken')).toEqual({ ...model(config, 'broken'), maxOutputSize: 4096 });
++    expect(result.failed).toEqual([
++      {
++        provider: 'openrouter',
++        reason: 'example/missing is not in the OpenRouter catalog; keeping its previous limits and efforts.',
++      },
++      {
++        provider: 'openrouter',
++        reason: `OpenRouter reports no valid context_length for ${PLAIN}; keeping its previous context size.`,
++      },
++    ]);
++  });
++
++  it('looks a :variant model up by its base id unless the catalog lists the full id', async () => {
++    const config = baseConfig();
++    config.models = {
++      nitro: { provider: 'openrouter', model: `${MUSE}:nitro`, maxContextSize: 1 },
++      free: { provider: 'openrouter', model: FREE, maxContextSize: 1 },
++      unknown: { provider: 'openrouter', model: 'example/unknown:floor', maxContextSize: 1 },
++    };
++    const host = memoryHost(config);
++
++    const result = await refresh(host);
++
++    expect(model(host.current(), 'nitro')).toMatchObject({ model: `${MUSE}:nitro`, maxContextSize: 1048576 });
++    expect(model(host.current(), 'free')).toMatchObject({ model: FREE, maxContextSize: 32768 });
++    expect(result.failed).toEqual([
++      {
++        provider: 'openrouter',
++        reason: 'example/unknown:floor is not in the OpenRouter catalog; keeping its previous limits and efforts.',
++      },
++    ]);
++  });
++
++  it.each([
++    ['an HTTP error', () => Response.json({ error: { message: 'service unavailable' } }, { status: 503 }), 'service unavailable'],
++    ['a network error', () => Promise.reject(new TypeError('fetch failed')), 'fetch failed'],
++    ['invalid JSON', () => new Response('<html>', { status: 200 }), 'not valid JSON'],
++    ['a catalog without data', () => Response.json({ models: [] }), 'no data list'],
++  ])('keeps every previous value and reports %s from the catalog', async (_name, respond, cause) => {
++    const host = memoryHost(baseConfig());
++
++    const result = await refresh(host, respond);
++
++    expect(host.writes).toEqual([]);
++    expect(host.current()).toEqual(baseConfig());
++    expect(result.changed).toEqual([]);
++    expect(result.failed.map((failure) => failure.provider).toSorted()).toEqual(['openrouter', 'openrouter-responses']);
++    expect(result.failed[0]!.reason).toMatch(
++      /^OpenRouter model catalog request failed \(.+\); keeping the previous limits and efforts\.$/,
++    );
++    expect(result.failed[0]!.reason).toContain(cause);
++  });
++
++  it('refuses redirects', async () => {
++    const host = memoryHost(baseConfig());
++
++    const refused = await refresh(host, () =>
++      Promise.reject(new TypeError('fetch failed', { cause: new Error('unexpected redirect') })),
++    );
++    expect(refused.calls[0]!.init.redirect).toBe('error');
++    expect(refused.failed[0]!.reason).toContain('(fetch failed: unexpected redirect)');
++
++    const followed = await refresh(host, () => new Response(null, { status: 302, headers: { Location: 'https://example.test/' } }));
++    expect(followed.failed[0]!.reason).toContain('(HTTP 302)');
++    expect(host.writes).toEqual([]);
++  });
++
++  it('stops waiting for the catalog response at the request timeout', async () => {
++    const host = memoryHost(baseConfig());
++    const fetchImpl = ((_url: string, init: RequestInit) =>
++      new Promise((_resolve, reject) => {
++        init.signal!.addEventListener(
++          'abort',
++          () => {
++            reject(init.signal!.reason);
++          },
++          { once: true },
++        );
++      })) as typeof fetch;
++
++    const result = await refreshOpenRouterModels(host, baseConfig(), { fetchImpl, requestTimeoutMs: 30 });
++
++    expect(host.writes).toEqual([]);
++    expect(result.failed.length).toBeGreaterThan(0);
++    expect(result.failed.every((failure) => failure.reason.includes('(timed out)'))).toBe(true);
++  });
++
++  it('gives the catalog body until the refresh deadline once the response has arrived', async () => {
++    const host = memoryHost(baseConfig());
++
++    const slow = await refreshOpenRouterModels(host, baseConfig(), {
++      fetchImpl: slowBodyFetch(80),
++      requestTimeoutMs: 20,
++      deadlineMs: 5_000,
++    });
++    expect(slow.failed).toEqual([]);
++    expect(slow.changed).toHaveLength(2);
++
++    const stalled = await refreshOpenRouterModels(memoryHost(baseConfig()), baseConfig(), {
++      fetchImpl: slowBodyFetch(),
++      requestTimeoutMs: 5_000,
++      deadlineMs: 40,
++    });
++    expect(stalled.changed).toEqual([]);
++    expect(stalled.failed.length).toBeGreaterThan(0);
++    expect(stalled.failed.every((failure) => failure.reason.includes('(timed out)'))).toBe(true);
++  });
++
++  it('writes nothing and reports the providers unchanged when the metadata is already current', async () => {
++    const host = memoryHost(baseConfig());
++    await refresh(host);
++    const writes = host.writes.length;
++
++    const second = await refresh(host);
++
++    expect(host.writes).toHaveLength(writes);
++    expect(second.changed).toEqual([]);
++    expect(second.failed).toEqual([]);
++    expect(second.unchanged.toSorted()).toEqual(['openrouter', 'openrouter-responses']);
++  });
++
++  it('selects aliases by their effective OpenRouter endpoint and protocol', async () => {
++    const host = memoryHost({
++      providers: {
++        openrouter: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1' },
++        table: { type: 'openai', env: { OPENAI_BASE_URL: 'https://openrouter.ai/api/v1/' } },
++        anthropic: { type: 'anthropic', baseUrl: 'https://openrouter.ai/api/v1' },
++        plainhttp: { type: 'openai', baseUrl: 'http://openrouter.ai/api/v1' },
++        pathed: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1/chat' },
++        elsewhere: { type: 'openai', baseUrl: 'https://example.test/v1' },
++        static: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', modelSource: 'static' },
++        registry: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', source: { url: 'https://example.test/api.json' } },
++        oauthed: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1', oauth: { storage: 'file', key: 'k' } },
++        __kimi_env__: { type: 'openai', baseUrl: 'https://openrouter.ai/api/v1' },
++      },
++      models: {
++        direct: { provider: 'openrouter', model: PLAIN, maxContextSize: 1 },
++        'via-env-table': { provider: 'table', model: PLAIN, maxContextSize: 1 },
++        'model-base-url': { provider: 'elsewhere', model: PLAIN, maxContextSize: 1, baseUrl: 'https://openrouter.ai/api/v1' },
++        'model-elsewhere': { provider: 'openrouter', model: PLAIN, maxContextSize: 1, baseUrl: 'https://example.test/v1' },
++        'responses-protocol': { provider: 'anthropic', model: PLAIN, maxContextSize: 1, protocol: 'openai_responses' },
++        'anthropic-protocol': { provider: 'openrouter', model: PLAIN, maxContextSize: 1, protocol: 'anthropic' },
++        'anthropic-provider': { provider: 'anthropic', model: PLAIN, maxContextSize: 1 },
++        http: { provider: 'plainhttp', model: PLAIN, maxContextSize: 1 },
++        'extra-path': { provider: 'pathed', model: PLAIN, maxContextSize: 1 },
++        'other-host': { provider: 'elsewhere', model: PLAIN, maxContextSize: 1 },
++        'static-source': { provider: 'static', model: PLAIN, maxContextSize: 1 },
++        'registry-source': { provider: 'registry', model: PLAIN, maxContextSize: 1 },
++        'oauth-provider': { provider: 'oauthed', model: PLAIN, maxContextSize: 1 },
++        'oauth-model': { provider: 'openrouter', model: PLAIN, maxContextSize: 1, oauth: { storage: 'file', key: 'k' } },
++        __kimi_env_model__: { provider: '__kimi_env__', model: PLAIN, maxContextSize: 1 },
++      },
++    });
++
++    const result = await refresh(host);
++
++    const refreshed = Object.entries(host.current().models!)
++      .filter(([, value]) => (value as Record<string, unknown>)['maxContextSize'] === 131072)
++      .map(([alias]) => alias)
++      .toSorted();
++    expect(refreshed).toEqual(['direct', 'model-base-url', 'responses-protocol', 'via-env-table']);
++    expect(result.failed).toEqual([]);
++  });
++
++  it('refreshes only the requested provider and sends nothing when it has no OpenRouter alias', async () => {
++    const host = memoryHost(baseConfig());
++
++    const none = await refresh(host, undefined, { providerId: 'other' });
++    expect(none.calls).toEqual([]);
++    expect(none).toMatchObject({ changed: [], unchanged: [], failed: [] });
++
++    const scoped = await refresh(host, undefined, { providerId: 'openrouter-responses' });
++    expect(scoped.calls).toHaveLength(1);
++    expect(scoped.changed.map((change) => change.providerId)).toEqual(['openrouter-responses']);
++    expect(model(host.current(), 'openrouter/muse')).toEqual(model(baseConfig(), 'openrouter/muse'));
++  });
++
++  it('never rewrites overrides and merges into the config as edited during the request', async () => {
++    const host = memoryHost(baseConfig());
++
++    const result = await refresh(host, () => {
++      host.edit((current) => {
++        current.defaultModel = 'openrouter-responses/optional';
++        const muse = current.models!['openrouter/muse'] as Record<string, unknown>;
++        muse['overrides'] = { maxContextSize: 500000, supportEfforts: ['low', 'high'] };
++        muse['displayName'] = 'Muse (edited)';
++        delete current.models!['openrouter-responses/optional'];
++        current.models!['openrouter/new'] = { provider: 'openrouter', model: 'example/new', maxContextSize: 5 };
++      });
++      return Response.json({ data: CATALOG });
++    });
++
++    const refreshed = host.current();
++    expect(refreshed.defaultModel).toBe('openrouter-responses/optional');
++    expect(model(refreshed, 'openrouter/muse')).toMatchObject({
++      displayName: 'Muse (edited)',
++      overrides: { maxContextSize: 500000, supportEfforts: ['low', 'high'] },
++      maxContextSize: 1048576,
++      supportEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
++    });
++    expect(refreshed.models).not.toHaveProperty('openrouter-responses/optional');
++    expect(result.failed).toEqual([
++      {
++        provider: 'openrouter',
++        reason: 'example/new is not in the OpenRouter catalog; keeping its previous limits and efforts.',
++      },
++    ]);
++  });
++
++  it("keeps an alias's previous efforts when they would break [secondary_model].default_effort", async () => {
++    const config = baseConfig();
++    config['secondaryModel'] = {
++      defaultModel: 'openrouter/muse',
++      models: { 'openrouter/muse': '', 'openrouter-responses/optional': '' },
++      defaultEffort: 'off',
++    };
++    const host = memoryHost(config);
++
++    const result = await refresh(host);
++
++    expect(model(host.current(), 'openrouter/muse')).toEqual({
++      ...model(config, 'openrouter/muse'),
++      maxContextSize: 1048576,
++      maxOutputSize: 943718,
++    });
++    expect(model(host.current(), 'openrouter-responses/optional')).toMatchObject({
++      offEffort: 'none',
++      capabilities: ['thinking'],
++    });
++    expect(result.failed).toEqual([
++      {
++        provider: 'openrouter',
++        reason:
++          '[secondary_model] default_effort "off" would no longer work with openrouter/muse: it always reasons. Change default_effort to apply OpenRouter\'s efforts; keeping its previous efforts.',
++      },
++    ]);
++  });
++
++  it('reports a failed config write instead of claiming a change', async () => {
++    const host = memoryHost(baseConfig());
++    host.setConfig = async () => {
++      throw new Error('config.toml could not be read');
++    };
++
++    const result = await refresh(host);
++
++    expect(result.changed).toEqual([]);
++    expect(result.failed).toEqual(
++      expect.arrayContaining([
++        { provider: 'openrouter', reason: expect.stringContaining('config.toml could not be read') },
++      ]),
++    );
++  });
++});
++
++describe('refreshProviderModels with OpenRouter aliases', () => {
++  it('refreshes OpenRouter aliases for scope all, but not in the OAuth-only refresh', async () => {
++    const calls: string[] = [];
++    vi.stubGlobal('fetch', async (url: string) => {
++      calls.push(url);
++      return Response.json({ data: CATALOG });
++    });
++    const config = baseConfig();
++    config.models!['openrouter/mandatory'] = { provider: 'openrouter', model: MANDATORY_NONE, maxContextSize: 1 };
++    const host = memoryHost(config);
++
++    const oauthOnly = await refreshProviderModels(host, { scope: 'oauth' });
++    expect(calls).toEqual([]);
++    expect(oauthOnly).toEqual({ changed: [], unchanged: [], failed: [] });
++
++    const result = await refreshProviderModels(host);
++
++    expect(calls).toEqual([CATALOG_URL]);
++    expect(result.failed).toEqual([]);
++    expect(result.changed.toSorted((a, b) => a.providerId.localeCompare(b.providerId))).toEqual([
++      {
++        providerId: 'openrouter',
++        providerName: 'openrouter',
++        added: 0,
++        removed: 0,
++        detail: 'limits and efforts of 2 models updated from OpenRouter',
++      },
++      {
++        providerId: 'openrouter-responses',
++        providerName: 'openrouter-responses',
++        added: 0,
++        removed: 0,
++        detail: 'limits and efforts of 1 model updated from OpenRouter',
++      },
++    ]);
++
++    const again = await refreshProviderModels(host);
++    expect(again.changed).toEqual([]);
++    expect(again.unchanged.toSorted()).toEqual(['openrouter', 'openrouter-responses']);
++  });
++
++  it('reports a catalog failure without aborting the rest of the refresh', async () => {
++    vi.stubGlobal('fetch', () => Promise.reject(new TypeError('fetch failed')));
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.changed).toEqual([]);
++    expect(result.failed.map((failure) => failure.provider).toSorted()).toEqual(['openrouter', 'openrouter-responses']);
++    expect(host.current()).toEqual(baseConfig());
++  });
++
++  it('reports a throw from the OpenRouter refresh as a failure and still runs the later branches', async () => {
++    const registryUrl = 'https://registry.example.test/api.json';
++    const calls: string[] = [];
++    vi.stubGlobal('fetch', async (url: string) => {
++      calls.push(url);
++      return Response.json({});
++    });
++    openRouterFault.error = new Error('OpenRouter refresh exploded');
++    const config = baseConfig();
++    config.providers['registry'] = {
++      type: 'openai',
++      baseUrl: 'https://example.test/v1',
++      source: { kind: 'apiJson', url: registryUrl, apiKey: '' },
++    };
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([
++      { provider: 'openrouter', reason: 'OpenRouter refresh exploded' },
++      { provider: 'registry', reason: `Custom registry at ${registryUrl} contained no usable providers.` },
++    ]);
++    expect(calls).toEqual([registryUrl]);
++    expect(host.current()).toEqual(config);
++  });
++});
+-- 
+2.50.1 (Apple Git-155)
+

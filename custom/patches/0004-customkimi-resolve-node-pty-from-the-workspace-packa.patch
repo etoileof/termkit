@@ -1,0 +1,40 @@
+From a645e302429fc1339329e9aa69e9dcdd4fa727b7 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Thu, 15 Oct 2026 13:21:47 +0200
+Subject: [PATCH 04/13] customkimi: resolve node-pty from the workspace
+ packages that declare it
+
+packages/services does not exist, and pnpm does not hoist node-pty to the root node_modules, so the permission fix could not find node-pty. Resolve it from agent-core-v2 and apps/kimi-code, relative to the script rather than the current directory.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ scripts/fix-node-pty-perms.mjs | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/fix-node-pty-perms.mjs b/scripts/fix-node-pty-perms.mjs
+index 5994235721da01f1bfbd2463ac115528b32a2a37..c547b393a808cec6bc925a3cd9842afd7636c734 100644
+--- a/scripts/fix-node-pty-perms.mjs
++++ b/scripts/fix-node-pty-perms.mjs
+@@ -17,10 +17,16 @@ import { dirname, join } from 'node:path';
+ 
+ function nodePtyRoot() {
+   const require = createRequire(import.meta.url);
+-  // Resolve from packages/services (where node-pty is declared) so we find the
+-  // workspace's hoisted copy regardless of where this script runs.
++  // Resolve from the workspace packages that declare node-pty (relative to this
++  // script, not the cwd) so we find the workspace's copy regardless of where
++  // this script runs. pnpm does not hoist node-pty to the root node_modules.
++  const workspaceRoot = dirname(import.meta.dirname);
+   const entry = require.resolve('node-pty', {
+-    paths: [join(process.cwd(), 'packages/services'), process.cwd()],
++    paths: [
++      join(workspaceRoot, 'packages/agent-core-v2'),
++      join(workspaceRoot, 'apps/kimi-code'),
++      process.cwd(),
++    ],
+   });
+   // .../node-pty/lib/index.js -> .../node-pty
+   return dirname(dirname(entry));
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,564 @@
+From d51c64eb33a8c40a97efd6938c323c2b293b256c Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Thu, 15 Oct 2026 15:45:36 +0200
+Subject: [PATCH 05/13] customkimi: show the active provider's balance in the
+ web UI
+
+kimi web and /web show a small badge before the composer's model picker with the balance of the provider serving the open session's model (ClosedRouter or 7api). If a web UI update moves the picker, the badge falls back to a corner pill. kap-server gets two generic hooks: startServer({ extraRoutes, webHtmlInjection }) and an htmlInjection option on the web asset routes. The CLI registers GET /customkimi/balance-badge.js and GET /api/customkimi/balance?model=<alias> (bearer auth like every /api route), answered by the same BillingMonitor as the TUI footer. The browser script reads the web UI's stored credential and the open session's model from the public session API, and never retries a rejected credential, so it cannot trip the failed-auth rate limit.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/cli/sub/web/balance-badge-script.ts   | 137 ++++++++++++++++++
+ .../src/cli/sub/web/balance-badge.ts          |  69 +++++++++
+ apps/kimi-code/src/cli/sub/web/run.ts         |  15 +-
+ .../test/cli/web/balance-badge.test.ts        |  99 +++++++++++++
+ packages/kap-server/src/routes/webAssets.ts   |  26 +++-
+ packages/kap-server/src/start.ts              |   6 +-
+ .../test/webAssetsInjection.test.ts           |  68 +++++++++
+ 7 files changed, 415 insertions(+), 5 deletions(-)
+ create mode 100644 apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+ create mode 100644 apps/kimi-code/src/cli/sub/web/balance-badge.ts
+ create mode 100644 apps/kimi-code/test/cli/web/balance-badge.test.ts
+ create mode 100644 packages/kap-server/test/webAssetsInjection.test.ts
+
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d3d95f51caf8c0bec8ff263ef4715c64686fa69
+--- /dev/null
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge-script.ts
+@@ -0,0 +1,137 @@
++/**
++ * Browser script for the web UI balance badge. It sits just before the model picker in
++ * the composer toolbar (`.mp-name`); if a web UI update moves the picker, it falls back
++ * to a small fixed pill in the bottom-right corner. It reads the web UI's own stored
++ * credential, asks the session API for the open session's model, refreshes every minute
++ * and whenever the session or model changes, and hides itself when no balance is known.
++ * A credential the server rejects is never retried, so the badge cannot trip the
++ * server's failed-auth rate limit.
++ */
++export function balanceBadgeScript(apiPath: string): string {
++  return `(function () {
++  'use strict';
++  var API = ${JSON.stringify(apiPath)};
++  var CREDENTIAL_KEY = 'kimi-web.server-credential';
++  var BADGE_ID = 'customkimi-balance';
++  var STYLE_ID = 'customkimi-balance-style';
++  var latest = null;
++  var rejected = null;
++  var lastSessionId;
++  var lastModelText;
++  var scheduled = false;
++
++  function credential() {
++    try {
++      var raw = localStorage.getItem(CREDENTIAL_KEY);
++      if (!raw) return null;
++      try {
++        var parsed = JSON.parse(raw);
++        if (parsed && typeof parsed.credential === 'string') return parsed.credential;
++      } catch (error) {}
++      return raw;
++    } catch (error) {
++      return null;
++    }
++  }
++
++  function sessionId() {
++    var match = location.pathname.match(/\\/sessions\\/(session_[\\w-]+)/);
++    return match ? match[1] : null;
++  }
++
++  function modelText() {
++    var picker = document.querySelector('.mp-name');
++    return picker ? picker.textContent : null;
++  }
++
++  function getJson(url, token) {
++    return fetch(url, { headers: token ? { Authorization: 'Bearer ' + token } : {} }).then(function (response) {
++      if (response.status === 401) {
++        rejected = token;
++        return null;
++      }
++      return response.ok ? response.json() : null;
++    });
++  }
++
++  function refresh() {
++    var token = credential() || '';
++    if (token === rejected) {
++      latest = null;
++      render();
++      return;
++    }
++    var id = sessionId();
++    var model = id
++      ? getJson('/api/v1/sessions/' + encodeURIComponent(id) + '/status', token).then(function (body) {
++          return body && body.data && typeof body.data.model === 'string' ? body.data.model : null;
++        })
++      : Promise.resolve(null);
++    model
++      .then(function (alias) {
++        if (token === rejected) return null;
++        return getJson(alias ? API + '?model=' + encodeURIComponent(alias) : API, token);
++      })
++      .then(function (body) { latest = body && body.data ? body.data : null; render(); })
++      .catch(function () { latest = null; render(); });
++  }
++
++  function ensureStyle() {
++    if (document.getElementById(STYLE_ID)) return;
++    var style = document.createElement('style');
++    style.id = STYLE_ID;
++    style.textContent =
++      '#' + BADGE_ID + '{font-size:13px;opacity:.6;white-space:nowrap;margin-right:12px;align-self:center}' +
++      '#' + BADGE_ID + '.ck-floating{position:fixed;right:16px;bottom:12px;margin:0;padding:3px 10px;' +
++      'border-radius:999px;background:rgba(127,127,127,.15);opacity:.85;z-index:2147483647}';
++    document.head.appendChild(style);
++  }
++
++  function render() {
++    var badge = document.getElementById(BADGE_ID);
++    if (!latest || typeof latest.usd !== 'number') {
++      if (badge) badge.remove();
++      return;
++    }
++    ensureStyle();
++    if (!badge) {
++      badge = document.createElement('span');
++      badge.id = BADGE_ID;
++    }
++    var text = latest.label + ' $' + latest.usd.toFixed(2);
++    if (badge.textContent !== text) badge.textContent = text;
++    badge.title = latest.label + ' account balance';
++    var picker = document.querySelector('.mp-name');
++    var anchor = picker ? picker.closest('button') || picker : null;
++    if (anchor && anchor.parentElement) {
++      badge.classList.remove('ck-floating');
++      if (badge.nextElementSibling !== anchor) anchor.parentElement.insertBefore(badge, anchor);
++    } else {
++      badge.classList.add('ck-floating');
++      if (badge.parentElement !== document.body) document.body.appendChild(badge);
++    }
++  }
++
++  function onChange() {
++    if (scheduled) return;
++    scheduled = true;
++    requestAnimationFrame(function () {
++      scheduled = false;
++      var id = sessionId();
++      var text = modelText();
++      if (id !== lastSessionId || text !== lastModelText) {
++        lastSessionId = id;
++        lastModelText = text;
++        refresh();
++      } else {
++        render();
++      }
++    });
++  }
++
++  new MutationObserver(onChange).observe(document.body, { childList: true, subtree: true, characterData: true });
++  setInterval(refresh, 60000);
++  onChange();
++})();
++`;
++}
+diff --git a/apps/kimi-code/src/cli/sub/web/balance-badge.ts b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff0897f1c051da698153a20eb663585c1738909f
+--- /dev/null
++++ b/apps/kimi-code/src/cli/sub/web/balance-badge.ts
+@@ -0,0 +1,69 @@
++import {
++  loadRuntimeConfigSafe,
++  resolveConfigPath,
++  type ModelAlias,
++  type ProviderConfig,
++} from '@moonshot-ai/kimi-code-sdk';
++
++import { modelResolver, type BillingSource } from '#/utils/billing/billing-monitor';
++import { asRecord } from '#/utils/billing/billing-provider';
++
++import { balanceBadgeScript } from './balance-badge-script';
++
++export const BALANCE_API_PATH = '/api/customkimi/balance';
++export const BALANCE_BADGE_SCRIPT_PATH = '/customkimi/balance-badge.js';
++export const BALANCE_BADGE_HTML = `<script src="${BALANCE_BADGE_SCRIPT_PATH}" defer></script>`;
++
++/** The parts of the configuration the badge needs. */
++export interface BadgeConfig {
++  readonly defaultModel?: string | undefined;
++  readonly models: Readonly<Record<string, Pick<ModelAlias, 'provider' | 'model' | 'baseUrl'>>>;
++  readonly providers: Readonly<Record<string, Pick<ProviderConfig, 'baseUrl'>>>;
++}
++
++interface BadgeReply {
++  type(contentType: string): BadgeReply;
++  send(payload: unknown): unknown;
++}
++
++/** The part of the web server (Fastify) the badge needs. */
++export interface BadgeRouteHost {
++  get(
++    path: string,
++    handler: (req: { readonly query: unknown }, reply: BadgeReply) => Promise<unknown>,
++  ): unknown;
++}
++
++function loadBadgeConfig(): BadgeConfig {
++  const { config } = loadRuntimeConfigSafe(resolveConfigPath({}));
++  return { defaultModel: config.defaultModel, models: config.models ?? {}, providers: config.providers ?? {} };
++}
++
++/**
++ * Adds the web UI balance badge: its script, served next to the web assets, and an API
++ * route (behind the server's bearer auth, like every /api route) returning the balance of
++ * the provider serving `?model=<alias>`, or the default model. The browser script looks up
++ * the open session's model itself, because the server redacts credentials before handlers
++ * run, so a handler cannot call the session API on the caller's behalf.
++ */
++export function registerBalanceBadge(
++  app: BadgeRouteHost,
++  billing: BillingSource,
++  loadConfig: () => BadgeConfig = loadBadgeConfig,
++): void {
++  const script = balanceBadgeScript(BALANCE_API_PATH);
++  app.get(BALANCE_BADGE_SCRIPT_PATH, async (_req, reply) =>
++    reply.type('text/javascript; charset=utf-8').send(script),
++  );
++
++  app.get(BALANCE_API_PATH, async (req, reply) => {
++    const config = loadConfig();
++    const requested = asRecord(req.query)?.['model'];
++    const alias = typeof requested === 'string' && requested !== '' ? requested : config.defaultModel;
++    const endpoint = alias === undefined ? undefined : modelResolver(config.models, config.providers)(alias);
++    const balance = billing.balanceFor(endpoint?.baseUrl);
++    return reply
++      .type('application/json; charset=utf-8')
++      .send({ code: 0, msg: 'success', data: balance ?? null });
++  });
++}
+diff --git a/apps/kimi-code/src/cli/sub/web/run.ts b/apps/kimi-code/src/cli/sub/web/run.ts
+index a881e534f70d1fe0ddff3fc347e0d9cfe3494eb5..fca3f9b8fb72e130faf1f6a5ca766bfb1f173b8e 100644
+--- a/apps/kimi-code/src/cli/sub/web/run.ts
++++ b/apps/kimi-code/src/cli/sub/web/run.ts
+@@ -23,8 +23,11 @@ import { openUrl as defaultOpenUrl } from '#/utils/open-url';
+ import { getDataDir } from '#/utils/paths';
+ import { persistedKimiOAuthRef } from '#/utils/region';
+ import { generateRemoteControlQr } from '#/utils/remote-control-qr';
++import { BillingMonitor } from '#/utils/billing/billing-monitor';
++import { createBillingProviders } from '#/utils/billing/providers';
+ 
+ import { initializeServerTelemetry } from '../../telemetry';
++import { BALANCE_BADGE_HTML, registerBalanceBadge } from './balance-badge';
+ import {
+   createKimiCodeHostIdentity,
+   getHostPackageRoot,
+@@ -375,6 +378,8 @@ async function runServerInProcess(
+       'dev mode: web assets not built; starting the API server without the web UI',
+     );
+   }
++  const billing = new BillingMonitor(createBillingProviders());
++  billing.start();
+   const v2 = await startServer({
+     host: options.host,
+     port: options.port,
+@@ -403,12 +408,20 @@ async function runServerInProcess(
+     // only covers host-level events.
+     telemetry: true,
+     webAssetsDir,
++    // CustomKIMI: the provider balance badge next to the web UI's model picker.
++    webHtmlInjection: BALANCE_BADGE_HTML,
++    extraRoutes: (app) => {
++      registerBalanceBadge(app, billing);
++    },
+   });
+   logger.info('serving the REST/WS API and the bundled web UI');
+   running = {
+     address: `http://${v2.host}:${v2.port}`,
+     logger,
+-    close: () => v2.close(),
++    close: () => {
++      billing.stop();
++      return v2.close();
++    },
+   };
+ 
+   track('server_started', { daemon: false });
+diff --git a/apps/kimi-code/test/cli/web/balance-badge.test.ts b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a15ddc2b473c5c43247da33cf7ff6a106440195c
+--- /dev/null
++++ b/apps/kimi-code/test/cli/web/balance-badge.test.ts
+@@ -0,0 +1,99 @@
++import { describe, expect, it } from 'vitest';
++
++import {
++  BALANCE_API_PATH,
++  BALANCE_BADGE_HTML,
++  BALANCE_BADGE_SCRIPT_PATH,
++  registerBalanceBadge,
++  type BadgeConfig,
++  type BadgeRouteHost,
++} from '#/cli/sub/web/balance-badge';
++import type { BillingSource } from '#/utils/billing/billing-monitor';
++
++type Handler = Parameters<BadgeRouteHost['get']>[1];
++
++const config: BadgeConfig = {
++  defaultModel: 'closerouter/openai-gpt-6-astra',
++  models: {
++    '7api/gpt-6-astra': { provider: '7api-responses', model: 'gpt-6-astra' },
++    'closerouter/openai-gpt-6-astra': { provider: 'closerouter', model: 'openai/gpt-6-astra' },
++    'other/model': { provider: 'other', model: 'model' },
++  },
++  providers: {
++    '7api-responses': { baseUrl: 'https://7api.st/v1' },
++    closerouter: { baseUrl: 'https://api.closerouter.dev/v1' },
++    other: { baseUrl: 'https://other.example/v1' },
++  },
++};
++
++const billing: BillingSource = {
++  start: () => {},
++  stop: () => {},
++  balanceFor: (baseUrl) => {
++    if (baseUrl === 'https://7api.st/v1') return { label: '7api', usd: 9.18 };
++    if (baseUrl === 'https://api.closerouter.dev/v1') return { label: 'ClosedRouter', usd: 18.2 };
++    return undefined;
++  },
++  sessionCostUsd: () => undefined,
++};
++
++function routes() {
++  const registered = new Map<string, Handler>();
++  registerBalanceBadge({ get: (path, handler) => registered.set(path, handler) }, billing, () => config);
++  return registered;
++}
++
++async function call(path: string, query: unknown) {
++  const reply = {
++    contentType: '',
++    payload: undefined as unknown,
++    type(contentType: string) {
++      this.contentType = contentType;
++      return this;
++    },
++    send(payload: unknown) {
++      this.payload = payload;
++      return this;
++    },
++  };
++  await routes().get(path)?.({ query }, reply);
++  return reply;
++}
++
++describe('web balance badge route', () => {
++  it('returns the balance of the provider serving the requested model', async () => {
++    const reply = await call(BALANCE_API_PATH, { model: '7api/gpt-6-astra' });
++
++    expect(reply.contentType).toBe('application/json; charset=utf-8');
++    expect(reply.payload).toEqual({ code: 0, msg: 'success', data: { label: '7api', usd: 9.18 } });
++  });
++
++  it('uses the default model when no model is given', async () => {
++    const reply = await call(BALANCE_API_PATH, {});
++
++    expect(reply.payload).toEqual({ code: 0, msg: 'success', data: { label: 'ClosedRouter', usd: 18.2 } });
++  });
++
++  it('returns no balance for unknown models or providers without billing', async () => {
++    expect((await call(BALANCE_API_PATH, { model: 'unknown/model' })).payload).toEqual({
++      code: 0,
++      msg: 'success',
++      data: null,
++    });
++    expect((await call(BALANCE_API_PATH, { model: 'other/model' })).payload).toEqual({
++      code: 0,
++      msg: 'success',
++      data: null,
++    });
++  });
++
++  it("serves a badge script that asks for the open session's model with the web credential", async () => {
++    const reply = await call(BALANCE_BADGE_SCRIPT_PATH, {});
++
++    expect(reply.contentType).toBe('text/javascript; charset=utf-8');
++    expect(reply.payload).toContain(BALANCE_API_PATH);
++    expect(reply.payload).toContain('/api/v1/sessions/');
++    expect(reply.payload).toContain('kimi-web.server-credential');
++    expect(BALANCE_BADGE_HTML).toBe(`<script src="${BALANCE_BADGE_SCRIPT_PATH}" defer></script>`);
++  });
++});
+diff --git a/packages/kap-server/src/routes/webAssets.ts b/packages/kap-server/src/routes/webAssets.ts
+index e453593171b2b1ae3abf51f1243477d437b7b013..78eac85ed8eafdf85477506ecc19464d66f031db 100644
+--- a/packages/kap-server/src/routes/webAssets.ts
++++ b/packages/kap-server/src/routes/webAssets.ts
+@@ -1,5 +1,5 @@
+ import { createReadStream } from 'node:fs';
+-import { stat } from 'node:fs/promises';
++import { readFile, stat } from 'node:fs/promises';
+ import { extname, join, normalize, relative, resolve, sep } from 'node:path';
+ 
+ import type { FastifyReply, FastifyRequest } from 'fastify';
+@@ -11,14 +11,19 @@ interface WebAssetRouteHost {
+   ): unknown;
+ }
+ 
++export interface WebAssetOptions {
++  readonly htmlInjection?: string | undefined;
++}
++
+ export async function registerWebAssetRoutes(
+   app: WebAssetRouteHost,
+   assetsDir: string,
++  options: WebAssetOptions = {},
+ ): Promise<void> {
+   await assertWebAssets(assetsDir);
+ 
+-  app.get('/', async (req, reply) => serveWebAsset(req, reply, assetsDir));
+-  app.get('/*', async (req, reply) => serveWebAsset(req, reply, assetsDir));
++  app.get('/', async (req, reply) => serveWebAsset(req, reply, assetsDir, options));
++  app.get('/*', async (req, reply) => serveWebAsset(req, reply, assetsDir, options));
+ }
+ 
+ async function assertWebAssets(assetsDir: string): Promise<void> {
+@@ -38,6 +43,7 @@ async function serveWebAsset(
+   req: FastifyRequest,
+   reply: FastifyReply,
+   assetsDir: string,
++  options: WebAssetOptions,
+ ): Promise<unknown> {
+   const requestUrl = new URL(req.url, 'http://kimi-web.local');
+   if (isReservedPath(requestUrl.pathname)) {
+@@ -54,6 +60,15 @@ async function serveWebAsset(
+     return reply.code(404).type('text/plain; charset=utf-8').send('Not found');
+   }
+ 
++  if (options.htmlInjection !== undefined && filePath === join(resolve(assetsDir), 'index.html')) {
++    const html = injectHtml(await readFile(filePath, 'utf8'), options.htmlInjection);
++    return reply
++      .type(mimeType(filePath))
++      .header('Cache-Control', cacheControl(assetsDir, filePath))
++      .header('Content-Length', String(Buffer.byteLength(html)))
++      .send(html);
++  }
++
+   return reply
+     .type(mimeType(filePath))
+     .header('Cache-Control', cacheControl(assetsDir, filePath))
+@@ -61,6 +76,11 @@ async function serveWebAsset(
+     .send(createReadStream(filePath));
+ }
+ 
++function injectHtml(html: string, snippet: string): string {
++  const headEnd = html.indexOf('</head>');
++  return headEnd < 0 ? html + snippet : html.slice(0, headEnd) + snippet + html.slice(headEnd);
++}
++
+ function cacheControl(assetsDir: string, filePath: string): string {
+   const assetPath = relative(assetsDir, filePath);
+   const fileName = filePath.slice(filePath.lastIndexOf(sep) + 1);
+diff --git a/packages/kap-server/src/start.ts b/packages/kap-server/src/start.ts
+index a69c1b744c24b1322f7393f0a6b42cedcff93a7f..cf8f568ed24f2da95e3b8c2fd08ca7b8f9d6d6c4 100644
+--- a/packages/kap-server/src/start.ts
++++ b/packages/kap-server/src/start.ts
+@@ -126,6 +126,8 @@ export interface ServerStartOptions {
+   readonly hostIdentity: ServerHostIdentity;
+   readonly skillDirs?: readonly string[];
+   readonly webAssetsDir?: string;
++  readonly webHtmlInjection?: string;
++  readonly extraRoutes?: (app: FastifyInstance) => Promise<void> | void;
+   readonly serverVersion?: string;
+   readonly telemetry?: boolean;
+ }
+@@ -602,8 +604,10 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
+     return reply.type('application/json').send(openApiDocument);
+   });
+ 
++  await opts.extraRoutes?.(app);
++
+   if (opts.webAssetsDir !== undefined) {
+-    await registerWebAssetRoutes(app, opts.webAssetsDir);
++    await registerWebAssetRoutes(app, opts.webAssetsDir, { htmlInjection: opts.webHtmlInjection });
+   }
+ 
+   try {
+diff --git a/packages/kap-server/test/webAssetsInjection.test.ts b/packages/kap-server/test/webAssetsInjection.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aee15a235f1fe5fa644f387707a45f767906ee91
+--- /dev/null
++++ b/packages/kap-server/test/webAssetsInjection.test.ts
+@@ -0,0 +1,68 @@
++import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++import Fastify, { type FastifyInstance } from 'fastify';
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++
++import { registerWebAssetRoutes } from '../src/routes/webAssets';
++
++const SNIPPET = '<script src="/extra.js" defer></script>';
++
++describe('web asset HTML injection', () => {
++  let app: FastifyInstance;
++  let assetsDir: string;
++
++  beforeEach(async () => {
++    assetsDir = await mkdtemp(join(tmpdir(), 'kimi-web-inject-'));
++    await mkdir(join(assetsDir, 'assets'));
++    await Promise.all([
++      writeFile(join(assetsDir, 'index.html'), '<html><head><title>Kimi</title></head><body></body></html>'),
++      writeFile(join(assetsDir, 'assets', 'index-Dy7xs5tu.js'), 'export {};'),
++    ]);
++    app = Fastify();
++  });
++
++  afterEach(async () => {
++    await app.close();
++    await rm(assetsDir, { recursive: true, force: true });
++  });
++
++  it.each(['/', '/index.html', '/sessions/session_abc'])(
++    'adds the snippet before </head> when serving the page at %s',
++    async (url) => {
++      await registerWebAssetRoutes(app, assetsDir, { htmlInjection: SNIPPET });
++      const response = await app.inject({ method: 'GET', url });
++
++      expect(response.statusCode).toBe(200);
++      expect(response.body).toBe(
++        `<html><head><title>Kimi</title>${SNIPPET}</head><body></body></html>`,
++      );
++      expect(response.headers['content-type']).toBe('text/html; charset=utf-8');
++      expect(response.headers['content-length']).toBe(String(Buffer.byteLength(response.body)));
++      expect(response.headers['cache-control']).toBe('no-cache');
++    },
++  );
++
++  it('appends the snippet when the page has no </head>', async () => {
++    await writeFile(join(assetsDir, 'index.html'), '<main>Kimi</main>');
++    await registerWebAssetRoutes(app, assetsDir, { htmlInjection: SNIPPET });
++    const response = await app.inject({ method: 'GET', url: '/' });
++
++    expect(response.body).toBe(`<main>Kimi</main>${SNIPPET}`);
++  });
++
++  it('leaves other assets untouched', async () => {
++    await registerWebAssetRoutes(app, assetsDir, { htmlInjection: SNIPPET });
++    const response = await app.inject({ method: 'GET', url: '/assets/index-Dy7xs5tu.js' });
++
++    expect(response.body).toBe('export {};');
++  });
++
++  it('serves the page unchanged without an injection', async () => {
++    await registerWebAssetRoutes(app, assetsDir);
++    const response = await app.inject({ method: 'GET', url: '/' });
++
++    expect(response.body).toBe('<html><head><title>Kimi</title></head><body></body></html>');
++  });
++});
+-- 
+2.50.1 (Apple Git-155)
+

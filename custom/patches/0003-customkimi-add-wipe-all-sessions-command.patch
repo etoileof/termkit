@@ -1,0 +1,158 @@
+From 9fa9c512dedbe2b644d6c3536468a53241cd15a2 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Thu, 15 Oct 2026 13:21:47 +0200
+Subject: [PATCH 03/13] customkimi: add /wipe-all-sessions command
+
+Delete every saved session across all workspaces through the harness session API. Requires '/wipe-all-sessions confirm'; without it only a warning is shown. If the current session is among those deleted, a fresh session starts.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/kimi-code/src/tui/commands/dispatch.ts |  6 ++++
+ apps/kimi-code/src/tui/commands/index.ts    |  7 +++-
+ apps/kimi-code/src/tui/commands/registry.ts |  7 ++++
+ apps/kimi-code/src/tui/commands/session.ts  | 37 +++++++++++++++++++++
+ apps/kimi-code/src/tui/kimi-tui.ts          |  6 ++++
+ 5 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/apps/kimi-code/src/tui/commands/dispatch.ts b/apps/kimi-code/src/tui/commands/dispatch.ts
+index 927e1fb8427136294df48a1d343ee58e923e3561..dea626ea28474bf565c49900af656e7fe60042f0 100644
+--- a/apps/kimi-code/src/tui/commands/dispatch.ts
++++ b/apps/kimi-code/src/tui/commands/dispatch.ts
+@@ -63,6 +63,7 @@ import {
+   handleForkCommand,
+   handleInitCommand,
+   handleTitleCommand,
++  handleWipeAllSessionsCommand,
+ } from './session';
+ import { handleSwarmCommand } from './swarm';
+ import { handleTowerCommand } from './tower';
+@@ -103,6 +104,7 @@ export {
+   handleForkCommand,
+   handleInitCommand,
+   handleTitleCommand,
++  handleWipeAllSessionsCommand,
+ } from './session';
+ export { handleUndoCommand } from './undo';
+ export { handleRemoteControlCommand, handleWebCommand } from './web';
+@@ -193,6 +195,7 @@ export interface SlashCommandHost {
+   setExitForegroundTask(task: (exitCode: number) => Promise<void>): void;
+   showHelpPanel(): void;
+   createNewSession(): Promise<void>;
++  closeSessionForWipe(): Promise<void>;
+   showSessionPicker(): Promise<void>;
+   sendNormalUserInput(text: string): void;
+   /**
+@@ -518,6 +521,9 @@ async function handleBuiltInSlashCommand(
+     case 'fork':
+       await handleForkCommand(host, args);
+       return;
++    case 'wipe-all-sessions':
++      await handleWipeAllSessionsCommand(host, args);
++      return;
+     case 'export-md':
+       await handleExportMdCommand(host, args);
+       return;
+diff --git a/apps/kimi-code/src/tui/commands/index.ts b/apps/kimi-code/src/tui/commands/index.ts
+index cdafaac1e6676784d9bfafc50cb000a50f3432c1..348774d2c0985cc30b959cfc12b71bb2f87a309c 100644
+--- a/apps/kimi-code/src/tui/commands/index.ts
++++ b/apps/kimi-code/src/tui/commands/index.ts
+@@ -28,7 +28,12 @@ export { handlePluginsCommand } from './plugins';
+ export { handleReloadCommand, handleReloadTuiCommand } from './reload';
+ export { handleGoalCommand, parseGoalCommand, goalObjectiveLengthWarning } from './goal';
+ export { goalArgumentCompletions } from './registry';
+-export { handleForkCommand, handleInitCommand, handleTitleCommand } from './session';
++export {
++  handleForkCommand,
++  handleInitCommand,
++  handleTitleCommand,
++  handleWipeAllSessionsCommand,
++} from './session';
+ export { handleUndoCommand } from './undo';
+ export { handleRemoteControlCommand, handleWebCommand } from './web';
+ export {
+diff --git a/apps/kimi-code/src/tui/commands/registry.ts b/apps/kimi-code/src/tui/commands/registry.ts
+index e4ad7ab4807df8f556a7e9b090520db78b6f2c85..fa87b3f8c6dbd5e01211253f4fa1dd695d985d0c 100644
+--- a/apps/kimi-code/src/tui/commands/registry.ts
++++ b/apps/kimi-code/src/tui/commands/registry.ts
+@@ -256,6 +256,13 @@ export const BUILTIN_SLASH_COMMANDS = [
+     description: 'Browse and resume sessions',
+     priority: 80,
+   },
++  {
++    name: 'wipe-all-sessions',
++    aliases: [],
++    description: 'Delete all saved sessions across workspaces (requires confirm)',
++    priority: 40,
++    availability: 'idle-only',
++  },
+   {
+     name: 'tasks',
+     aliases: ['task'],
+diff --git a/apps/kimi-code/src/tui/commands/session.ts b/apps/kimi-code/src/tui/commands/session.ts
+index 67f3600101e903ea2454f99c0fa85b5a19aab668..d36b1e3484006263465482b95255959c818c0f70 100644
+--- a/apps/kimi-code/src/tui/commands/session.ts
++++ b/apps/kimi-code/src/tui/commands/session.ts
+@@ -17,6 +17,43 @@ import type { SlashCommandHost } from './dispatch';
+ // Session commands
+ // ---------------------------------------------------------------------------
+ 
++export async function handleWipeAllSessionsCommand(
++  host: SlashCommandHost,
++  args: string,
++): Promise<void> {
++  if (args.trim().toLowerCase() !== 'confirm') {
++    host.showStatus(
++      'This permanently deletes all saved session histories across workspaces. Run /wipe-all-sessions confirm to continue.',
++      'warning',
++    );
++    return;
++  }
++
++  try {
++    await host.waitForSessionAssembly();
++    const sessions = await host.harness.listSessions({ includeArchived: true });
++    const sessionIds = new Set(sessions.map((session) => session.id));
++
++    const currentSessionId = host.state.appState.sessionId;
++    if (currentSessionId.length > 0 && sessionIds.has(currentSessionId)) {
++      await host.closeSessionForWipe();
++    }
++
++    let deleted = 0;
++    for (const sessionId of sessionIds) {
++      await host.harness.deleteSession(sessionId);
++      deleted += 1;
++    }
++
++    if (sessionIds.has(currentSessionId)) {
++      await host.createNewSession();
++    }
++    host.showStatus(`Deleted ${String(deleted)} saved session${deleted === 1 ? '' : 's'}.`);
++  } catch (error) {
++    host.showError(`Failed to wipe saved sessions: ${formatErrorMessage(error)}`);
++  }
++}
++
+ export async function handleTitleCommand(host: SlashCommandHost, args: string): Promise<void> {
+   const title = args.trim();
+   if (title.length === 0) {
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index 748d8a914331f4e3a2c5ea84de398e69cc147b5b..8c270056fe14c69f50bdf82f18c069f000721c5c 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -2967,6 +2967,12 @@ export class KimiTUI {
+     this.staging.releaseAll();
+   }
+ 
++  async closeSessionForWipe(): Promise<void> {
++    await this.closeSession('wiping all saved sessions');
++    this.setAppState({ sessionId: '' });
++    this.clearTranscriptAndRedraw();
++  }
++
+   private unloadCurrentSession(reason: string): Session | undefined {
+     const previous = this.session;
+     this.sessionEventUnsubscribe?.();
+-- 
+2.50.1 (Apple Git-155)
+

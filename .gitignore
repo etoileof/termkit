@@ -1,2 +1,15 @@
-/payload/
+# Builds and state that scripts/update.sh creates when this folder is used as the CustomKIMI folder.
+/source/
+/source.next/
+/source.previous/
+/custom/history/
+/dist/
+
 .DS_Store
+*.log
+.env*
+config.toml
+
+# Agent scratch and the old tarball layout.
+/.superpowers/
+/payload/

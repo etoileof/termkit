@@ -1,0 +1,283 @@
+From 1a59aea308ea440a5811202dc86466445e442190 Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Fri, 23 Oct 2026 09:49:05 +0200
+Subject: [PATCH 12/13] customkimi: show each model's context window in the
+ /model picker
+
+---
+ .../src/tui/components/chrome/footer.ts       |  8 ++--
+ .../tui/components/dialogs/model-selector.ts  | 16 +++++++-
+ .../kimi-code/src/utils/usage/usage-format.ts | 31 +++++++++++++++
+ .../components/dialogs/model-selector.test.ts | 23 ++++++++++-
+ .../components/panels/footer-context.test.ts  | 12 ++++++
+ .../test/tui/kimi-tui-message-flow.test.ts    |  4 +-
+ .../test/utils/usage/usage-format.test.ts     | 38 +++++++++++++++++++
+ 7 files changed, 122 insertions(+), 10 deletions(-)
+
+diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
+index 577c66fd010bd782aa962f169e72601ad524b6fc..1aa8f1fcfd89f32244d15487e04f888a2d1f044a 100644
+--- a/apps/kimi-code/src/tui/components/chrome/footer.ts
++++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
+@@ -36,7 +36,7 @@ import {
+ } from '#/utils/billing/billing-monitor';
+ import { createBillingProviders } from '#/utils/billing/providers';
+ import {
+-  formatTokenCount,
++  formatContextSize,
+   usagePercent,
+   usagePercentFromRatio,
+ } from '#/utils/usage/usage-format';
+@@ -178,13 +178,13 @@ function shortenCwd(path: string): string {
+ /**
+  * Footer context readout. Percent comes from the exact token counts when
+  * both are known (the ratio can lag a step behind); otherwise it falls
+- * back to the precomputed ratio. Counts use the shared 1024-based
+- * formatter.
++ * back to the precomputed ratio. Counts use the context-size formatter,
++ * so the window reads as in the /model picker ("1M", "200k", "256k").
+  */
+ function formatContextStatus(usage: number, tokens?: number, maxTokens?: number): string {
+   if (maxTokens !== undefined && maxTokens > 0 && tokens !== undefined) {
+     const pct = String(usagePercent(tokens, maxTokens));
+-    return `context: ${pct}% (${formatTokenCount(tokens)}/${formatTokenCount(maxTokens)})`;
++    return `context: ${pct}% (${formatContextSize(tokens)}/${formatContextSize(maxTokens)})`;
+   }
+   return `context: ${String(usagePercentFromRatio(usage))}%`;
+ }
+diff --git a/apps/kimi-code/src/tui/components/dialogs/model-selector.ts b/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
+index 2532f14a2d83cc1a1481ade2c148136df0755339..221234d53eab33cd41e07ab285d09bc6590fe0c0 100644
+--- a/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
++++ b/apps/kimi-code/src/tui/components/dialogs/model-selector.ts
+@@ -13,6 +13,7 @@ import { DEFAULT_OAUTH_PROVIDER_NAME, PRODUCT_NAME } from '#/constant/app';
+ import { CURRENT_MARK, SELECT_POINTER } from '#/tui/constant/symbols';
+ import { currentTheme } from '#/tui/theme';
+ import { SearchableList } from '#/tui/utils/searchable-list';
++import { formatContextSize } from '#/utils/usage/usage-format';
+ 
+ import type { ChoiceOption } from './choice-picker';
+ 
+@@ -25,6 +26,8 @@ interface ModelChoice {
+   readonly name: string;
+   /** Provider display name (right column). */
+   readonly provider: string;
++  /** Context window ("1M", "200k"; middle column), empty when unknown. */
++  readonly context: string;
+   /** Combined text the fuzzy filter matches against (name + provider). */
+   readonly label: string;
+ }
+@@ -95,7 +98,10 @@ function createModelChoices(models: Record<string, ModelAlias>): readonly ModelC
+     const effective = effectiveModelAlias(cfg);
+     const name = modelDisplayName(alias, effective);
+     const provider = providerDisplayName(effective.provider);
+-    return { alias, model: effective, name, provider, label: `${name} (${provider})` };
++    const contextWindow = effective.maxContextSize;
++    const context =
++      Number.isFinite(contextWindow) && contextWindow > 0 ? formatContextSize(contextWindow) : '';
++    return { alias, model: effective, name, provider, context, label: `${name} (${provider})` };
+   });
+ }
+ 
+@@ -318,9 +324,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
+       // the provider + "← current" marker still fit on normal terminal widths.
+       const nameCap = Math.max(8, Math.floor(width * 0.5));
+       let nameWidth = 0;
++      let contextWidth = 0;
+       for (let i = view.page.start; i < view.page.end; i++) {
+         const choice = view.items[i];
+-        if (choice !== undefined) nameWidth = Math.max(nameWidth, visibleWidth(choice.name));
++        if (choice === undefined) continue;
++        nameWidth = Math.max(nameWidth, visibleWidth(choice.name));
++        contextWidth = Math.max(contextWidth, visibleWidth(choice.context));
+       }
+       nameWidth = Math.min(nameWidth, nameCap);
+ 
+@@ -334,6 +343,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
+         const namePad = ' '.repeat(Math.max(0, nameWidth - visibleWidth(truncatedName)));
+         let line = currentTheme.fg(isSelected ? 'primary' : 'textDim', `  ${pointer} `);
+         line += (isSelected ? currentTheme.boldFg('primary', truncatedName) : currentTheme.fg('text', truncatedName)) + namePad;
++        if (contextWidth > 0) {
++          line += '  ' + currentTheme.fg('textDim', choice.context.padStart(contextWidth));
++        }
+         line += '  ' + currentTheme.fg('textMuted', choice.provider);
+         if (isCurrent) {
+           line += ' ' + currentTheme.fg('success', CURRENT_MARK);
+diff --git a/apps/kimi-code/src/utils/usage/usage-format.ts b/apps/kimi-code/src/utils/usage/usage-format.ts
+index 1d332b302b0ebfa05836710de2aa091f1b559903..1eac8b523e2595977ab22fc7b3de4029fc482a9d 100644
+--- a/apps/kimi-code/src/utils/usage/usage-format.ts
++++ b/apps/kimi-code/src/utils/usage/usage-format.ts
+@@ -22,6 +22,37 @@ export function formatTokenCount(n: number): string {
+   return String(n);
+ }
+ 
++/**
++ * Format a context window, or a token count shown against one, the way
++ * providers advertise sizes: decimal units when they come out exact
++ * (1000000 → "1M", 200000 → "200k", 1050000 → "1.05M"), else binary units
++ * when those do (262144 → "256k", 1048576 → "1M"), else rounded decimal
++ * units ("944k", "12.3k").
++ */
++export function formatContextSize(n: number): string {
++  if (!Number.isFinite(n) || n < 0) return '0';
++  if (n < 1000) return String(Math.round(n));
++  return exactSize(n, 1000) ?? exactSize(n, 1024) ?? roundedSize(n);
++}
++
++function exactSize(n: number, base: number): string | undefined {
++  const mega = base * base;
++  if (n >= mega) return (n * 100) % mega === 0 ? `${trimDecimals(n / mega, 2)}M` : undefined;
++  if (n % base !== 0 || n / base >= 1000) return undefined;
++  return `${String(n / base)}k`;
++}
++
++function roundedSize(n: number): string {
++  if (n >= 999_500) return `${trimDecimals(n / 1_000_000, 2)}M`;
++  const k = n / 1000;
++  return `${k >= 100 ? String(Math.round(k)) : trimDecimals(k, 1)}k`;
++}
++
++/** Up to `digits` decimals with trailing zeros dropped ("1.50" → "1.5", "1.00" → "1"). */
++function trimDecimals(v: number, digits: number): string {
++  return v.toFixed(digits).replace(/\.?0+$/, '');
++}
++
+ /** One decimal place, dropping a redundant ".0" ("1.0" → "1", "1.5" stays). */
+ function trimDecimal(v: number): string {
+   const s = v.toFixed(1);
+diff --git a/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts b/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
+index e5159ec0d927074cfa7bb14b24f9eeeb7017a05f..f552ee82c1e9bde9063e576cdf70a74c35d0c883 100644
+--- a/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
++++ b/apps/kimi-code/test/tui/components/dialogs/model-selector.test.ts
+@@ -56,8 +56,8 @@ describe('ModelSelectorComponent', () => {
+     });
+ 
+     const out = text(picker);
+-    // Model name on the left, provider on the right, with the current marker.
+-    expect(out).toMatch(/❯ Kimi K2\s+Kimi Code ← current/);
++    // Model name on the left, context window, provider on the right, with the current marker.
++    expect(out).toMatch(/❯ Kimi K2\s+200k\s+Kimi Code ← current/);
+     // Provider is no longer inlined in parentheses next to the name.
+     expect(out).not.toContain('Kimi K2 (Kimi Code)');
+   });
+@@ -285,6 +285,25 @@ describe('ModelSelectorComponent', () => {
+     expect(text(picker)).toContain('▼ 4 more');
+   });
+ 
++  it('right-aligns each model\'s context window, overrides included', () => {
++    const picker = new ModelSelectorComponent({
++      models: {
++        big: { ...model('Big'), maxContextSize: 1_000_000 },
++        mid: { ...model('Mid'), maxContextSize: 262_144 },
++        pinned: { ...model('Pinned'), maxContextSize: 262_144, overrides: { maxContextSize: 65_536 } },
++      },
++      currentValue: 'big',
++      currentThinkingEffort: 'on',
++      onSelect: vi.fn(),
++      onCancel: vi.fn(),
++    });
++
++    const out = text(picker);
++    expect(out).toContain('❯ Big       1M  Kimi Code ← current');
++    expect(out).toContain('    Mid     256k  Kimi Code');
++    expect(out).toContain('    Pinned   64k  Kimi Code');
++  });
++
+   it('never renders a line wider than the terminal', () => {
+     const picker = new ModelSelectorComponent({
+       models: {
+diff --git a/apps/kimi-code/test/tui/components/panels/footer-context.test.ts b/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
+index 100f5f6a3bae8ff55b1f1e77918ec2329d491011..c8d57a438e4125a29fae4392b2dbc447b3d0bb90 100644
+--- a/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
++++ b/apps/kimi-code/test/tui/components/panels/footer-context.test.ts
+@@ -90,6 +90,18 @@ describe('FooterComponent — context NaN resilience', () => {
+     expect(out).toMatch(/context: 42% \(420k\/1M\)/);
+   });
+ 
++  it('reads a decimal window as the /model picker does (1M, not 977k)', () => {
++    const fc = new FooterComponent(
++      baseState({
++        contextUsage: 0.12,
++        contextTokens: 120_000,
++        maxContextTokens: 1_000_000,
++      }),
++    );
++    const out = strip(fc.render(200).join(''));
++    expect(out).toMatch(/context: 12% \(120k\/1M\)/);
++  });
++
+   it('tokens provided but max=0 → falls back to percent-only, no division-by-zero artefact', () => {
+     const fc = new FooterComponent(
+       baseState({ contextUsage: 0, contextTokens: 500, maxContextTokens: 0 }),
+diff --git a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
+index c7cb6506bca3275ccb7249ad131315a116da1955..e58869a4ce6b06861f4f2af8622ced8aad4590b8 100644
+--- a/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
++++ b/apps/kimi-code/test/tui/kimi-tui-message-flow.test.ts
+@@ -10444,8 +10444,8 @@ capabilities = ["image_in", "video_in"]
+     });
+     const picker = driver.state.editorContainer.children[0];
+     const pickerOutput = stripSgr((picker as TabbedModelSelectorComponent).render(120).join('\n'));
+-    expect(pickerOutput).toMatch(/Kimi K2\s+Kimi Code ← current/);
+-    expect(pickerOutput).toMatch(/❯ Kimi Turbo\s+Kimi Code/);
++    expect(pickerOutput).toMatch(/Kimi K2\s+100\s+Kimi Code ← current/);
++    expect(pickerOutput).toMatch(/❯ Kimi Turbo\s+100\s+Kimi Code/);
+     (picker as TabbedModelSelectorComponent).handleInput('t');
+     (picker as TabbedModelSelectorComponent).handleInput('u');
+     const filteredOutput = stripSgr((picker as TabbedModelSelectorComponent).render(120).join('\n'));
+diff --git a/apps/kimi-code/test/utils/usage/usage-format.test.ts b/apps/kimi-code/test/utils/usage/usage-format.test.ts
+index 375bdbd487d1e664e282cefd6e2be91fb3e0811b..a5ecccbc9267a9806089f5b60f049d57328e6012 100644
+--- a/apps/kimi-code/test/utils/usage/usage-format.test.ts
++++ b/apps/kimi-code/test/utils/usage/usage-format.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, it, expect } from 'vitest';
+ 
+ import {
++  formatContextSize,
+   formatTokenCount,
+   quotaUsageRows,
+   renderProgressBar,
+@@ -10,6 +11,43 @@ import {
+   usagePercentFromRatio,
+ } from '#/utils/usage/usage-format';
+ 
++describe('formatContextSize', () => {
++  it('passes values below 1000 through', () => {
++    expect(formatContextSize(0)).toBe('0');
++    expect(formatContextSize(999)).toBe('999');
++  });
++
++  it('prefers exact decimal units, as providers advertise sizes', () => {
++    expect(formatContextSize(1_000)).toBe('1k');
++    expect(formatContextSize(128_000)).toBe('128k');
++    expect(formatContextSize(200_000)).toBe('200k');
++    expect(formatContextSize(1_000_000)).toBe('1M');
++    expect(formatContextSize(1_050_000)).toBe('1.05M');
++  });
++
++  it('falls back to exact binary units for power-of-two sizes', () => {
++    expect(formatContextSize(2_048)).toBe('2k');
++    expect(formatContextSize(65_536)).toBe('64k');
++    expect(formatContextSize(262_144)).toBe('256k');
++    expect(formatContextSize(786_432)).toBe('768k');
++    expect(formatContextSize(1_048_576)).toBe('1M');
++    expect(formatContextSize(1_572_864)).toBe('1.5M');
++  });
++
++  it('rounds sizes exact in neither unit in decimal units', () => {
++    expect(formatContextSize(1_536)).toBe('1.5k');
++    expect(formatContextSize(12_345)).toBe('12.3k');
++    expect(formatContextSize(943_718)).toBe('944k');
++    expect(formatContextSize(999_999)).toBe('1M');
++    expect(formatContextSize(1_024_000)).toBe('1.02M');
++  });
++
++  it('clamps negatives and NaN to 0', () => {
++    expect(formatContextSize(-1)).toBe('0');
++    expect(formatContextSize(Number.NaN)).toBe('0');
++  });
++});
++
+ describe('formatTokenCount', () => {
+   it('passes small values through unchanged', () => {
+     expect(formatTokenCount(0)).toBe('0');
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1619 @@
+From b9d8646b162bb9e68969fd215e7799e5c7eecd70 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Fri, 16 Oct 2026 13:23:42 +0200
+Subject: [PATCH 07/13] customkimi: bill every agent of a session in the footer
+ cost
+
+The footer priced only the main agent's usage, so foreground, background
+and nested subagents were never billed, and a resumed session lost the
+subagents it had run before.
+
+A session-scoped billing service keeps each agent's cumulative per-model
+usage keyed by agent id and replaces that snapshot on every record instead
+of adding it, so no request is counted twice. On first use it restores the
+durable usage.record lines of every registered agent (holding a log lease
+while reading) and picks up agents registered later; afterwards it
+announces every change, including a background subagent that finishes
+after the main turn. A malformed usage record or an unreadable journal
+hides the cost instead of showing a partial total; a damaged journal is
+read up to its last valid line.
+
+The SDK exposes the result as SessionStatus.billingUsage and on a
+main-agent status event that still carries the main agent's own snapshot,
+so the parent's usage and context meter stay unchanged. The TUI footer
+prices billingUsage and falls back to the main agent's usage for engines
+that do not report it.
+
+Sums that include a request without a reported cost stay unknown instead
+of counting it as free, provider costs must be finite numbers, and the
+klient usage schema keeps the cost field.
+---
+ .changeset/session-cost-subagents.md          |   5 +
+ .changeset/session-cost-unknown.md            |   5 +
+ .../src/tui/components/chrome/footer.ts       |   4 +-
+ .../tui/controllers/session-event-handler.ts  |   5 +
+ apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
+ apps/kimi-code/src/tui/types.ts               |   9 +-
+ .../test/tui/components/chrome/footer.test.ts |  31 ++
+ .../session-event-handler-compaction.test.ts  |  50 +++
+ .../test/tui/kimi-tui-startup.test.ts         |  37 ++
+ .../src/agent/usage/usageEvents.ts            |   1 +
+ .../src/features/usage/usageFeature.ts        |   2 +
+ .../llm/requester/bases/anthropic/format.ts   |   2 +-
+ .../llm/requester/bases/openai/format.ts      |   2 +-
+ packages/agent-core-v2/src/human/llm/usage.ts |   3 +-
+ .../src/human/test/llm/usage.test.ts          |   9 +
+ packages/agent-core-v2/src/index.ts           |   1 +
+ .../src/session/usage/sessionBilling.ts       |  47 ++
+ .../session/usage/sessionBillingService.ts    | 167 +++++++
+ .../test/agent/usage/sessionBilling.test.ts   | 421 ++++++++++++++++++
+ .../llm-adapter/contract/usage-tokens.test.ts |   8 +
+ packages/klient/src/contract/agent/schemas.ts |   1 +
+ packages/node-sdk/src/sdk-rpc-client-v2.ts    |   6 +
+ packages/node-sdk/src/types.ts                |   9 +
+ packages/node-sdk/src/v2/session-wiring.ts    |  24 +
+ .../node-sdk/test/session-billing.test.ts     | 294 ++++++++++++
+ .../test/session-event-wiring.test.ts         |  69 ++-
+ 26 files changed, 1211 insertions(+), 8 deletions(-)
+ create mode 100644 .changeset/session-cost-subagents.md
+ create mode 100644 .changeset/session-cost-unknown.md
+ create mode 100644 packages/agent-core-v2/src/session/usage/sessionBilling.ts
+ create mode 100644 packages/agent-core-v2/src/session/usage/sessionBillingService.ts
+ create mode 100644 packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts
+ create mode 100644 packages/node-sdk/test/session-billing.test.ts
+
+diff --git a/.changeset/session-cost-subagents.md b/.changeset/session-cost-subagents.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c6ac50e591d7a8590cc37b1ffdaecc6c1d537cd
+--- /dev/null
++++ b/.changeset/session-cost-subagents.md
+@@ -0,0 +1,5 @@
++---
++"@moonshot-ai/kimi-code": patch
++---
++
++Include every subagent's spending in the footer's session cost.
+diff --git a/.changeset/session-cost-unknown.md b/.changeset/session-cost-unknown.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d341f58005ae1450adbd4c68c1bdb2d79729ed7
+--- /dev/null
++++ b/.changeset/session-cost-unknown.md
+@@ -0,0 +1,5 @@
++---
++"@moonshot-ai/kimi-code": patch
++---
++
++Stop counting requests without a reported cost as free in the footer's session cost.
+diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
+index 645a3d8d16cf532673dbc4df5520dcb2359939a1..577c66fd010bd782aa962f169e72601ad524b6fc 100644
+--- a/apps/kimi-code/src/tui/components/chrome/footer.ts
++++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
+@@ -601,7 +601,9 @@ export class FooterComponent implements Component {
+     const resolve = modelResolver(state.availableModels, state.availableProviders);
+     return {
+       balance: this.billing.balanceFor(resolve(state.model).baseUrl),
+-      sessionCostUsd: this.billing.sessionCostUsd(state.sessionUsage, resolve),
++      // The whole session's spend, subagents included; engines that do not
++      // report it fall back to the main agent's own usage.
++      sessionCostUsd: this.billing.sessionCostUsd(state.billingUsage ?? state.sessionUsage, resolve),
+     };
+   }
+ 
+diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+index b14c7f2ee2fe237b576eb319ba01cf674c5bc687..55790856f58f7c2090d7e62028b33a6a6fdb9ae2 100644
+--- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
++++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+@@ -275,6 +275,11 @@ export class SessionEventHandler {
+ 
+   handleEvent(event: Event, sendQueued: (item: QueuedMessage) => void): void {
+     this.notifications.handleEvent(event);
++    // Session-wide billing covers every agent, so take it before child events
++    // are routed away; it never touches the main agent's usage or context.
++    if (event.type === 'agent.status.updated' && event.billingUsage !== undefined) {
++      this.host.setAppState({ billingUsage: event.billingUsage });
++    }
+     if (this.subAgentEventHandler.routeChildAgentEvent(event)) return;
+ 
+     if ('turnId' in event && event.turnId !== undefined) {
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index 62a3fee61cdb09eaf4e887feb11039d578005f84..f391d6ba71d3837cba349adecee965238f3c78b1 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -2924,6 +2924,7 @@ export class KimiTUI {
+       sessionId: session.id,
+       cumulativeTokens: 0,
+       sessionUsage: undefined,
++      billingUsage: undefined,
+     });
+     this.session = session;
+     this.surveyController.seedUserTurnCount(initialUserTurnCount);
+@@ -2933,6 +2934,7 @@ export class KimiTUI {
+   }
+ 
+   async syncRuntimeState(session: Session = this.requireSession()): Promise<void> {
++    const billingBefore = this.state.appState.billingUsage;
+     const [status, goalResult] = await Promise.all([session.getStatus(), session.getGoal()]);
+     this.setAppState({
+       sessionId: session.id,
+@@ -2948,6 +2950,11 @@ export class KimiTUI {
+       cumulativeTokens:
+         status.usage?.total === undefined ? 0 : sumTokenUsage(status.usage.total),
+       sessionUsage: status.usage,
++      // A billing event that arrived while the status was being read is newer.
++      billingUsage:
++        this.state.appState.billingUsage === billingBefore
++          ? status.billingUsage
++          : this.state.appState.billingUsage,
+       sessionTitle: session.summary?.title ?? null,
+       goal: goalResult.goal,
+     });
+diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
+index 66a326257554667e8ee620a44569fa6c50f5a9e2..49286596c5edaa5ed0b180ff57b8c288d8af7625 100644
+--- a/apps/kimi-code/src/tui/types.ts
++++ b/apps/kimi-code/src/tui/types.ts
+@@ -65,8 +65,15 @@ export interface AppState {
+   contextTokens: number;
+   maxContextTokens: number;
+   cumulativeTokens?: number;
+-  /** Token usage of the active session, per model; the footer prices it. */
++  /** Token usage of the main agent, per model. */
+   sessionUsage?: SessionUsage;
++  /**
++   * Token usage of every agent in the session (subagents included, each
++   * counted once), per model; the footer prices it. Never feeds the context
++   * meter. Empty both before anything is spent and while the session's usage
++   * cannot be fully accounted for.
++   */
++  billingUsage?: SessionUsage;
+   isCompacting: boolean;
+   isReplaying: boolean;
+   streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
+diff --git a/apps/kimi-code/test/tui/components/chrome/footer.test.ts b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+index e8636c52e52c509a18e22625fdc5ef2e393baa67..2e6d356ce48e4dd1100ec161728b7e56d3e95ec3 100644
+--- a/apps/kimi-code/test/tui/components/chrome/footer.test.ts
++++ b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+@@ -268,6 +268,37 @@ describe('FooterComponent', () => {
+       footer.dispose();
+     });
+ 
++    it('prices the whole session, subagents included, and never shows a partial total', () => {
++      const tokens = (cost: number | undefined) => ({
++        inputOther: 100,
++        output: 10,
++        inputCacheRead: 0,
++        inputCacheCreation: 0,
++        cost,
++      });
++      const state: AppState = {
++        ...appState,
++        sessionUsage: { total: tokens(0.01), byModel: { 'closerouter/astra': tokens(0.01) } },
++        billingUsage: {
++          total: tokens(0.31),
++          byModel: { 'closerouter/astra': tokens(0.07), 'closerouter-anthropic/opus': tokens(0.24) },
++        },
++      };
++      const render = (patch: Partial<AppState>) => {
++        const footer = new FooterComponent({ ...state, ...patch }, () => {}, new BillingMonitor([]));
++        const rendered = plain(footer);
++        footer.dispose();
++        return rendered;
++      };
++
++      expect(render({})).toContain('session cost $0.3100');
++      expect(render({ billingUsage: undefined })).toContain('session cost $0.0100');
++      expect(render({ billingUsage: {} })).not.toContain('session cost');
++      expect(
++        render({ billingUsage: { byModel: { 'closerouter/astra': tokens(0.3), unpriced: tokens(undefined) } } }),
++      ).not.toContain('session cost');
++    });
++
+     it('starts billing with the footer and stops it on dispose', () => {
+       const billing = fakeBilling({});
+       const start = vi.spyOn(billing, 'start');
+diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+index 1eb522ea1dbfa2aa0db80fd05a4bbc6702904932..237e5d0950696d9c3e99ef15d9c03262d648d66b 100644
+--- a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
++++ b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+@@ -92,6 +92,56 @@ describe('SessionEventHandler session usage', () => {
+     );
+     expect(host.state.appState.sessionUsage).toEqual(usage);
+   });
++
++  it('takes session-wide billing without touching the main agent usage or context meter', () => {
++    const { host } = makeHost();
++    Object.assign(host.state.appState, { contextTokens: 500, maxContextTokens: 1_000, contextUsage: 0.5 });
++    const handler = new SessionEventHandler(host);
++    const tokens = (inputOther: number, cost: number) => ({
++      inputOther,
++      output: 1,
++      inputCacheRead: 0,
++      inputCacheCreation: 0,
++      cost,
++    });
++    const main = { total: tokens(10, 0.01), byModel: { m: tokens(10, 0.01) } };
++    const billing = { total: tokens(90_010, 0.31), byModel: { m: tokens(90_010, 0.31) } };
++    const mainMeter = { contextTokens: 500, maxContextTokens: 1_000, contextUsage: 0.5, model: 'kimi-model' };
++
++    handler.handleEvent({ type: 'agent.status.updated', sessionId: 's1', agentId: 'main', usage: main } as any, () => {});
++    handler.handleEvent(
++      {
++        type: 'agent.status.updated',
++        sessionId: 's1',
++        agentId: 'agent-1',
++        usage: { total: tokens(90_000, 0.3) },
++        contextTokens: 90_000,
++        maxContextTokens: 200_000,
++        model: 'child-model',
++      } as any,
++      () => {},
++    );
++
++    expect(host.state.appState.sessionUsage).toEqual(main);
++    expect(host.state.appState).toMatchObject(mainMeter);
++    expect(host.state.appState.billingUsage).toBeUndefined();
++
++    handler.handleEvent(
++      {
++        type: 'agent.status.updated',
++        sessionId: 's1',
++        agentId: 'main',
++        usage: main,
++        ...mainMeter,
++        billingUsage: billing,
++      } as any,
++      () => {},
++    );
++
++    expect(host.state.appState.billingUsage).toEqual(billing);
++    expect(host.state.appState.sessionUsage).toEqual(main);
++    expect(host.state.appState).toMatchObject(mainMeter);
++  });
+ });
+ 
+ describe('SessionEventHandler compaction cache bookkeeping', () => {
+diff --git a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+index 6985fb0b96ca05c11e048528d107859a47fe3532..339ff2825a31fe5f918cd07eb93b10c954fdadef 100644
+--- a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
++++ b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+@@ -1007,6 +1007,43 @@ describe('KimiTUI startup', () => {
+     expect(driver.state.appState.goal).toEqual(goal);
+   });
+ 
++  it('takes session-wide billing from the resumed status and drops it when switching sessions', async () => {
++    const tokens = { inputOther: 100, output: 10, inputCacheRead: 0, inputCacheCreation: 0 };
++    const billingUsage = { total: { ...tokens, cost: 0.31 }, byModel: { k2: { ...tokens, cost: 0.31 } } };
++    const usage = { total: { ...tokens, cost: 0.01 }, byModel: { k2: { ...tokens, cost: 0.01 } } };
++    const session = makeSession({
++      id: 'ses-latest',
++      getStatus: vi.fn(async () => ({
++        model: 'k2',
++        thinkingEffort: 'off',
++        permission: 'manual',
++        planMode: false,
++        contextTokens: 10,
++        maxContextTokens: 100,
++        contextUsage: 0.1,
++        usage,
++        billingUsage,
++      })),
++    });
++    const harness = makeHarness(session, { listSessions: vi.fn(async () => [{ id: 'ses-latest' }]) });
++    const driver = makeDriver(harness, makeStartupInput({ continue: true }));
++
++    await expect(driver.init()).resolves.toBe(true);
++    expect(driver.state.appState).toMatchObject({ sessionUsage: usage, billingUsage, contextTokens: 10 });
++
++    await driver.setSession(makeSession({ id: 'ses-other' }));
++    expect(driver.state.appState.billingUsage).toBeUndefined();
++    expect(driver.state.appState.sessionUsage).toBeUndefined();
++
++    const newer = { total: { ...tokens, cost: 0.5 } };
++    session.getStatus.mockImplementationOnce(async () => {
++      driver.state.appState.billingUsage = newer;
++      return { ...(await session.getStatus()), billingUsage };
++    });
++    await driver.syncRuntimeState(session);
++    expect(driver.state.appState.billingUsage).toBe(newer);
++  });
++
+   it('syncs goal state regardless of the goal flag', async () => {
+     const goal = goalSnapshot();
+     const session = makeSession({
+diff --git a/packages/agent-core-v2/src/agent/usage/usageEvents.ts b/packages/agent-core-v2/src/agent/usage/usageEvents.ts
+index 33c5921093dbb6979be9af39c9422e090a2d66db..cabc0b1514306bc607cb09fa921cb7f4671b4d08 100644
+--- a/packages/agent-core-v2/src/agent/usage/usageEvents.ts
++++ b/packages/agent-core-v2/src/agent/usage/usageEvents.ts
+@@ -92,5 +92,6 @@ export interface AgentStatusUpdatedEvent {
+   readonly towerExitReason?: TowerExitReason;
+   readonly permission?: PermissionMode;
+   readonly usage?: UsageStatus;
++  readonly billingUsage?: UsageStatus;
+   readonly phase?: AgentPhase;
+ }
+diff --git a/packages/agent-core-v2/src/features/usage/usageFeature.ts b/packages/agent-core-v2/src/features/usage/usageFeature.ts
+index d22046eacb3419f9054402b621405f63ffa07158..83d51766c501ad2f61e5d14f261ff60353cb66d3 100644
+--- a/packages/agent-core-v2/src/features/usage/usageFeature.ts
++++ b/packages/agent-core-v2/src/features/usage/usageFeature.ts
+@@ -4,6 +4,7 @@ import { registerFeature } from '#/features/featureRegistry';
+ import { ISessionUsageService } from '#/session/usage/sessionUsage';
+ import { SessionUsageService } from '#/session/usage/sessionUsageService';
+ import { UsageAgentModelDefinition } from '#/session/usage/usageAgentModel';
++import { ISessionBillingService, SessionBillingService } from '#/session/usage/sessionBillingService';
+ 
+ export class UsageFeature extends Feature {
+   static override readonly name = 'usage';
+@@ -12,6 +13,7 @@ export class UsageFeature extends Feature {
+     super();
+     this.contributeAgentModel(UsageAgentModelDefinition);
+     this.contributeService(LifecycleScope.Session, ISessionUsageService, SessionUsageService);
++    this.contributeService(LifecycleScope.Session, ISessionBillingService, SessionBillingService);
+   }
+ }
+ 
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
+index 49859c08b5c57482c4baee64c9867c8d966907ce..138cd1282acb7f1aaeff61ee78661ceca784507d 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
+@@ -98,7 +98,7 @@ function parseRawUsage(usage: AnthropicRawUsage | undefined): Partial<TokenUsage
+   }
+   const patch: Partial<TokenUsage> = {
+     raw: usage as Record<string, unknown>,
+-    cost: typeof usage.cost === 'number' ? usage.cost : undefined,
++    cost: typeof usage.cost === 'number' && Number.isFinite(usage.cost) ? usage.cost : undefined,
+   };
+   if (typeof usage.input_tokens === 'number') {
+     patch.inputOther = usage.input_tokens;
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+index 32fa3679a286259fc5d19994ac8e1c704ba16581..bb1e4a7eeccf4dc4a1306e2a57660aecc9a9bb01 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+@@ -135,7 +135,7 @@ export function parseOpenAIUsage(usage: OpenAIRawUsage | null | undefined): Toke
+     inputCacheCreation: 0,
+     raw: usage as Record<string, unknown>,
+   };
+-  if (usage.cost !== undefined) result.cost = usage.cost;
++  if (typeof usage.cost === 'number' && Number.isFinite(usage.cost)) result.cost = usage.cost;
+   return result;
+ }
+ 
+diff --git a/packages/agent-core-v2/src/human/llm/usage.ts b/packages/agent-core-v2/src/human/llm/usage.ts
+index bd5bb8d955c9567132ada162eacd1425bc3ded83..aba39052cd1725ea60f38aaabd9cbb9f8b13918f 100644
+--- a/packages/agent-core-v2/src/human/llm/usage.ts
++++ b/packages/agent-core-v2/src/human/llm/usage.ts
+@@ -20,14 +20,13 @@ export function grandTotal(usage: TokenUsage): number {
+ }
+ 
+ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+-  const cost = a.cost === undefined && b.cost === undefined ? undefined : (a.cost ?? 0) + (b.cost ?? 0);
+   const result: TokenUsage = {
+     inputOther: a.inputOther + b.inputOther,
+     output: a.output + b.output,
+     inputCacheRead: a.inputCacheRead + b.inputCacheRead,
+     inputCacheCreation: a.inputCacheCreation + b.inputCacheCreation,
+   };
+-  if (cost !== undefined) result.cost = cost;
++  if (a.cost !== undefined && b.cost !== undefined) result.cost = a.cost + b.cost;
+   return result;
+ }
+ 
+diff --git a/packages/agent-core-v2/src/human/test/llm/usage.test.ts b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
+index 5161d3f84c428b398d2b76d1badb0498c15ff4f2..afe38e4350fe11d9fa607d7705e3da8d936df860 100644
+--- a/packages/agent-core-v2/src/human/test/llm/usage.test.ts
++++ b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
+@@ -50,6 +50,15 @@ describe('openAIFormat stream usage', () => {
+     parse({ usage: null }, sink);
+     expect(usages).toEqual([]);
+   });
++
++  it('treats a cost that is not a number as unreported', () => {
++    const { sink, usages } = createSink();
++    const parse = openAIFormat.createStreamParser();
++    parse({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, cost: null } } as never, sink);
++    parse({ choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, cost: '0.5' } } as never, sink);
++    expect(usages.map((usage) => usage.cost)).toEqual([undefined, undefined]);
++    expect(usages.every((usage) => !('cost' in usage))).toBe(true);
++  });
+ });
+ 
+ describe('openAI responses usage', () => {
+diff --git a/packages/agent-core-v2/src/index.ts b/packages/agent-core-v2/src/index.ts
+index a3e304095512cf15c286859d9db01bdf467150f4..aeecfcd935b8a12572bc3ff606ce1aca13141aa9 100644
+--- a/packages/agent-core-v2/src/index.ts
++++ b/packages/agent-core-v2/src/index.ts
+@@ -411,6 +411,7 @@ export * from '#/agent/usage/cacheProbeService';
+ export * from '#/session/usage/sessionUsage';
+ export * from '#/session/usage/usageAgentModel';
+ export * from '#/session/usage/sessionUsageService';
++export * from '#/session/usage/sessionBillingService';
+ import '#/features/usage/usageFeature';
+ export * from '#/agent/toolDedupe/toolDedupe';
+ export * from '#/agent/toolDedupe/toolDedupeService';
+diff --git a/packages/agent-core-v2/src/session/usage/sessionBilling.ts b/packages/agent-core-v2/src/session/usage/sessionBilling.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ace8550c35e947d46e2513c148a2b590b730758
+--- /dev/null
++++ b/packages/agent-core-v2/src/session/usage/sessionBilling.ts
+@@ -0,0 +1,47 @@
++import type { UsageStatus } from '#/agent/usage/usage';
++import { copyUsage } from '#/agent/usage/usageOps';
++import { addUsage, type TokenUsage } from '#human/llm/usage';
++
++export type UsageByModel = Readonly<Record<string, TokenUsage>>;
++
++export class SessionBilling {
++  private readonly agents = new Map<string, UsageByModel>();
++
++  replace(agentId: string, byModel: UsageByModel | undefined): boolean {
++    const next = copyByModel(byModel ?? {});
++    const previous = this.agents.get(agentId);
++    if (previous !== undefined && JSON.stringify(previous) === JSON.stringify(next)) return false;
++    this.agents.set(agentId, next);
++    return true;
++  }
++
++  snapshot(): UsageStatus {
++    const byModel: Record<string, TokenUsage> = {};
++    for (const usage of this.agents.values()) {
++      for (const [model, tokens] of Object.entries(usage)) {
++        const previous = byModel[model];
++        byModel[model] = previous === undefined ? copyUsage(tokens) : addUsage(previous, tokens);
++      }
++    }
++    let total: TokenUsage | undefined;
++    for (const tokens of Object.values(byModel)) {
++      total = total === undefined ? copyUsage(tokens) : addUsage(total, tokens);
++    }
++    return { byModel: total === undefined ? undefined : byModel, total };
++  }
++}
++
++export function accumulateByModel(
++  byModel: Record<string, TokenUsage>,
++  model: string,
++  usage: TokenUsage,
++): void {
++  const previous = byModel[model];
++  byModel[model] = previous === undefined ? copyUsage(usage) : addUsage(previous, usage);
++}
++
++function copyByModel(byModel: UsageByModel): UsageByModel {
++  return Object.fromEntries(
++    Object.entries(byModel).map(([model, usage]) => [model, copyUsage(usage)]),
++  );
++}
+diff --git a/packages/agent-core-v2/src/session/usage/sessionBillingService.ts b/packages/agent-core-v2/src/session/usage/sessionBillingService.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f2638feb95d14796fbcebdd1315b28305a82b5f
+--- /dev/null
++++ b/packages/agent-core-v2/src/session/usage/sessionBillingService.ts
+@@ -0,0 +1,167 @@
++import { createDecorator } from '#/_base/di/instantiation';
++import { Service } from '#/_base/di/service';
++import { Emitter, type Event } from '#/_base/event';
++import { ILogService } from '#/_base/log/log';
++import type { UsageStatus } from '#/agent/usage/usage';
++import { UsageRecord } from '#/agent/usage/usageOps';
++import type { TokenUsage } from '#human/llm/usage';
++import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
++import { ISessionContext } from '#/session/sessionContext/sessionContext';
++import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
++import { AGENT_WIRE_RECORD_KEY, type WireRecord } from '#/wire/record';
++
++import { accumulateByModel, SessionBilling } from './sessionBilling';
++import { ISessionUsageService } from './sessionUsage';
++
++export interface ISessionBillingService {
++  readonly _serviceBrand: undefined;
++
++  readonly ready: Promise<void>;
++  readonly onDidChange: Event<UsageStatus>;
++  snapshot(): UsageStatus;
++}
++
++export const ISessionBillingService = createDecorator<ISessionBillingService>('sessionBillingService');
++
++export class SessionBillingService extends Service implements ISessionBillingService {
++  declare readonly _serviceBrand: undefined;
++
++  private readonly billing = new SessionBilling();
++  private readonly liveAgents = new Set<string>();
++  private readonly knownAgents = new Set<string>();
++  private readonly onDidChangeEmitter = this._register(new Emitter<UsageStatus>());
++  readonly onDidChange: Event<UsageStatus> = this.onDidChangeEmitter.event;
++  private initialRestore: Promise<void> | undefined;
++  private restoreQueue: Promise<void> = Promise.resolve();
++  private restored = false;
++  private incomplete = false;
++  private announced: string | undefined;
++
++  constructor(
++    @ISessionUsageService private readonly usage: ISessionUsageService,
++    @ISessionMetadata private readonly metadata: ISessionMetadata,
++    @IAppendLogStore private readonly log: IAppendLogStore,
++    @ISessionContext private readonly context: ISessionContext,
++    @ILogService private readonly logger: ILogService,
++  ) {
++    super();
++    this._register(
++      this.usage.onDidRecord(({ agent }) => {
++        this.liveAgents.add(agent.agentId);
++        this.knownAgents.add(agent.agentId);
++        this.billing.replace(agent.agentId, this.usage.status(agent).byModel);
++        this.announce();
++      }),
++    );
++    this._register(
++      this.metadata.onDidChangeMetadata(({ changed }) => {
++        if (this.initialRestore === undefined || !changed.includes('agents')) return;
++        this.restoreQueue = this.restoreQueue.then(async () => {
++          await this.restoreRegisteredAgents();
++          this.announce();
++        });
++      }),
++    );
++  }
++
++  get ready(): Promise<void> {
++    if (this.initialRestore === undefined) {
++      this.initialRestore = this.restoreRegisteredAgents().then(() => {
++        this.restored = true;
++        this.announce();
++      });
++      this.restoreQueue = this.initialRestore;
++    }
++    return this.initialRestore;
++  }
++
++  snapshot(): UsageStatus {
++    if (!this.restored) {
++      void this.ready;
++      return {};
++    }
++    return this.incomplete ? {} : this.billing.snapshot();
++  }
++
++  private announce(): void {
++    if (!this.restored || this._store.isDisposed) return;
++    const status = this.snapshot();
++    const key = JSON.stringify(status);
++    if (key === this.announced) return;
++    this.announced = key;
++    this.onDidChangeEmitter.fire(status);
++  }
++
++  private async restoreRegisteredAgents(): Promise<void> {
++    if (this._store.isDisposed) return;
++    try {
++      const metadata = await this.metadata.read();
++      for (const agentId of Object.keys(metadata.agents ?? {})) {
++        if (this.knownAgents.has(agentId)) continue;
++        this.knownAgents.add(agentId);
++        const byModel = await this.readDurableUsage(agentId);
++        if (byModel !== undefined && !this.liveAgents.has(agentId)) {
++          this.billing.replace(agentId, byModel);
++        }
++      }
++    } catch (error) {
++      this.markIncomplete('session metadata could not be read', error);
++    }
++  }
++
++  private async readDurableUsage(agentId: string): Promise<Record<string, TokenUsage> | undefined> {
++    const byModel: Record<string, TokenUsage> = {};
++    const scope = this.context.scope(`agents/${agentId}`);
++    const lease = this.log.acquire(scope, AGENT_WIRE_RECORD_KEY);
++    try {
++      for await (const record of this.log.read<WireRecord>(scope, AGENT_WIRE_RECORD_KEY, {
++        onTruncate: (truncation) => {
++          this.logger.warn('session billing reads the valid prefix of a damaged wire journal', {
++            agentId,
++            lineNumber: truncation.lineNumber,
++            reason: truncation.reason,
++          });
++        },
++      })) {
++        if (record.type !== UsageRecord.type) continue;
++        const owner = record['agentId'];
++        const usage = record['usage'];
++        const model = record['model'];
++        if (owner !== undefined && owner !== agentId) continue;
++        if (typeof model !== 'string' || !isTokenUsage(usage)) {
++          this.markIncomplete(`agent ${agentId} has a malformed usage record`);
++          continue;
++        }
++        accumulateByModel(byModel, model, usage);
++      }
++    } catch (error) {
++      this.markIncomplete(`agent ${agentId} usage could not be read`, error);
++      return undefined;
++    } finally {
++      lease.dispose();
++    }
++    return byModel;
++  }
++
++  private markIncomplete(reason: string, error?: unknown): void {
++    this.logger.warn('session billing is incomplete; hiding the session cost', {
++      reason,
++      error: error instanceof Error ? error.message : error,
++    });
++    if (this.incomplete) return;
++    this.incomplete = true;
++    this.announce();
++  }
++}
++
++function isTokenUsage(value: unknown): value is TokenUsage {
++  if (typeof value !== 'object' || value === null) return false;
++  const usage = value as Record<string, unknown>;
++  return (
++    typeof usage['inputOther'] === 'number' &&
++    typeof usage['output'] === 'number' &&
++    typeof usage['inputCacheRead'] === 'number' &&
++    typeof usage['inputCacheCreation'] === 'number' &&
++    (usage['cost'] === undefined || (typeof usage['cost'] === 'number' && Number.isFinite(usage['cost'])))
++  );
++}
+diff --git a/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts b/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cba9152ed1e3114e141b783ac84fe43885023d57
+--- /dev/null
++++ b/packages/agent-core-v2/test/agent/usage/sessionBilling.test.ts
+@@ -0,0 +1,421 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { SyncDescriptor } from '#/_base/di/descriptors';
++import { DisposableStore } from '#/_base/di/lifecycle';
++import { TestInstantiationService } from '#/_base/di/test';
++import { Emitter } from '#/_base/event';
++import { ILogService } from '#/_base/log/log';
++import type { AgentContext } from '#/agent/agentContext/agentContext';
++import { IAgentBlobService } from '#/agent/blob/agentBlobService';
++import { IAgentScopeContext, makeAgentScopeContext } from '#/agent/scopeContext/scopeContext';
++import type { UsageStatus } from '#/agent/usage/usage';
++import { IEventBus, type ISessionEventBus } from '#/app/event/eventBus';
++import { EventBusService } from '#/app/event/eventBusService';
++import { ITelemetryService, noopTelemetryService } from '#/app/telemetry/telemetry';
++import type { TokenUsage } from '#human/llm/usage';
++import { AppendLogStore } from '#/persistence/backends/node-fs/appendLogStore';
++import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
++import { InMemorySessionLockService } from '#/persistence/backends/memory/sessionLockService';
++import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
++import { ISessionLockService } from '#/persistence/interface/sessionLock';
++import { IFileSystemStorageService } from '#/persistence/interface/storage';
++import { ISessionContext, makeSessionContext } from '#/session/sessionContext/sessionContext';
++import type {
++  ISessionMetadata,
++  SessionMeta,
++  SessionMetadataChangedEvent,
++} from '#/session/sessionMetadata/sessionMetadata';
++import { SessionBilling } from '#/session/usage/sessionBilling';
++import { SessionBillingService } from '#/session/usage/sessionBillingService';
++import { SessionUsageService } from '#/session/usage/sessionUsageService';
++import type { IEventDispatcher } from '#/state/eventDispatcher';
++import { IWireService } from '#/wire/wire';
++import { WireService } from '#/wire/wireService';
++import { AGENT_WIRE_RECORD_KEY, type WireRecord } from '#/wire/record';
++
++import { noopLogger, registerTestEventDispatcher } from '../../wire/stubs';
++
++const SESSION_SCOPE = 'sessions/s1';
++
++const blob: IAgentBlobService = {
++  _serviceBrand: undefined,
++  offloadParts: async (parts) => parts,
++  loadParts: async (parts) => parts,
++  isBlobRef: () => false,
++};
++
++function tokens(cost: number | undefined, inputOther = 100): TokenUsage {
++  const usage: TokenUsage = { inputOther, output: 10, inputCacheRead: 0, inputCacheCreation: 0 };
++  if (cost !== undefined) usage.cost = cost;
++  return usage;
++}
++
++interface Session {
++  readonly storage: InMemoryStorageService;
++  readonly log: IAppendLogStore;
++  readonly locks: ISessionLockService;
++  readonly context: ISessionContext;
++  usage: SessionUsageService;
++  agentIds: string[];
++}
++
++interface LiveAgent {
++  readonly agent: AgentContext;
++  readonly dispatcher: IEventDispatcher;
++  close(): Promise<void>;
++}
++
++const cleanups: Array<() => Promise<void> | void> = [];
++
++afterEach(async () => {
++  for (const cleanup of cleanups.splice(0).toReversed()) await cleanup();
++});
++
++function createSession(): Session {
++  const storage = new InMemoryStorageService();
++  const disposables = new DisposableStore();
++  const ix = disposables.add(new TestInstantiationService());
++  ix.stub(IFileSystemStorageService, storage);
++  ix.set(IAppendLogStore, new SyncDescriptor(AppendLogStore));
++  const log = ix.get(IAppendLogStore);
++  const locks = disposables.add(new InMemorySessionLockService());
++  const context = makeSessionContext({
++    sessionId: 's1',
++    workspaceId: 'w1',
++    sessionDir: '',
++    sessionScope: SESSION_SCOPE,
++    cwd: '',
++  });
++  cleanups.push(() => {
++    disposables.dispose();
++  });
++  return { storage, log, locks, context, usage: new SessionUsageService(), agentIds: [] };
++}
++
++async function startAgent(session: Session, agentId: string): Promise<LiveAgent> {
++  const disposables = new DisposableStore();
++  const ix = disposables.add(new TestInstantiationService());
++  ix.stub(IFileSystemStorageService, session.storage);
++  ix.stub(IAppendLogStore, session.log);
++  ix.stub(ILogService, noopLogger);
++  ix.stub(ITelemetryService, noopTelemetryService);
++  ix.stub(IAgentBlobService, blob);
++  ix.stub(ISessionLockService, session.locks);
++  ix.stub(ISessionContext, session.context);
++  ix.set(IEventBus, new SyncDescriptor(EventBusService));
++  ix.stub(
++    IAgentScopeContext,
++    makeAgentScopeContext({ agentId, agentScope: `${SESSION_SCOPE}/agents/${agentId}` }),
++  );
++  ix.set(IWireService, new SyncDescriptor(WireService));
++  (ix.get(IEventBus) as ISessionEventBus).activateAgent(ix.get(IAgentScopeContext).agentContext);
++  const dispatcher = registerTestEventDispatcher(ix);
++  await ix.get(IWireService).seal();
++  await dispatcher.restore();
++  if (!session.agentIds.includes(agentId)) session.agentIds.push(agentId);
++  let closed = false;
++  const close = async (): Promise<void> => {
++    if (closed) return;
++    closed = true;
++    await dispatcher.flush();
++    await session.log.flush();
++    disposables.dispose();
++  };
++  cleanups.push(close);
++  return { agent: ix.get(IAgentScopeContext).agentContext, dispatcher, close };
++}
++
++interface TestMetadata extends ISessionMetadata {
++  announceAgents(): void;
++}
++
++function metadataOf(session: Session, read?: () => Promise<SessionMeta>): TestMetadata {
++  const changed = new Emitter<SessionMetadataChangedEvent>();
++  cleanups.push(() => {
++    changed.dispose();
++  });
++  return {
++    onDidChangeMetadata: changed.event,
++    announceAgents: () => {
++      changed.fire({ changed: ['agents'] });
++    },
++    read:
++      read ??
++      (async () => ({
++        id: 's1',
++        createdAt: 0,
++        updatedAt: 0,
++        archived: false,
++        agents: Object.fromEntries(
++          session.agentIds.map((id, index) => [
++            id,
++            { parentAgentId: index === 0 ? undefined : session.agentIds[index - 1] },
++          ]),
++        ),
++      })),
++  } as unknown as TestMetadata;
++}
++
++function startBilling(
++  session: Session,
++  options: { log?: IAppendLogStore; metadata?: ISessionMetadata } = {},
++): { billing: SessionBillingService; events: UsageStatus[] } {
++  const billing = new SessionBillingService(
++    session.usage,
++    options.metadata ?? metadataOf(session),
++    options.log ?? session.log,
++    session.context,
++    noopLogger,
++  );
++  const events: UsageStatus[] = [];
++  billing.onDidChange((status) => {
++    events.push(status);
++  });
++  cleanups.push(() => {
++    billing.dispose();
++  });
++  return { billing, events };
++}
++
++describe('SessionBilling', () => {
++  it('replaces cumulative per-agent snapshots instead of adding them again', () => {
++    const billing = new SessionBilling();
++    const main = { a: tokens(1) };
++    expect(billing.replace('main', main)).toBe(true);
++    expect(billing.replace('child', { a: tokens(2) })).toBe(true);
++    expect(billing.replace('child', { a: tokens(2) })).toBe(false);
++    expect(billing.replace('grandchild', { b: tokens(0) })).toBe(true);
++
++    expect(billing.snapshot()).toEqual({
++      byModel: { a: { ...tokens(3, 200), output: 20 }, b: tokens(0) },
++      total: { ...tokens(3, 300), output: 30 },
++    });
++
++    billing.replace('child', { a: tokens(5, 300) });
++    expect(billing.snapshot().total?.cost).toBe(6);
++    main.a.cost = 100;
++    expect(billing.snapshot().total?.cost).toBe(6);
++  });
++
++  it('keeps a model cost unknown when any agent lacks it, without hiding other models', () => {
++    const billing = new SessionBilling();
++    billing.replace('main', { a: tokens(1), b: tokens(2) });
++    billing.replace('child', { a: tokens(undefined) });
++
++    const snapshot = billing.snapshot();
++    expect(snapshot.byModel?.['a']).not.toHaveProperty('cost');
++    expect(snapshot.byModel?.['b']?.cost).toBe(2);
++    expect(snapshot.total).not.toHaveProperty('cost');
++  });
++
++  it('reports no usage before any agent spent anything', () => {
++    expect(new SessionBilling().snapshot()).toEqual({ byModel: undefined, total: undefined });
++  });
++});
++
++describe('SessionBillingService', () => {
++  it('bills main, child and grandchild exactly once, live and again after a restart', async () => {
++    const session = createSession();
++    const { billing, events } = startBilling(session);
++    await billing.ready;
++    const main = await startAgent(session, 'main');
++    const child = await startAgent(session, 'agent-0');
++    const grandchild = await startAgent(session, 'agent-1');
++
++    await session.usage.record(main.agent, 'router/astra', tokens(0.01), { type: 'turn', turnId: 1 });
++    await session.usage.record(main.agent, 'router/astra', tokens(0.01), { type: 'turn', turnId: 1 });
++    await session.usage.record(child.agent, 'router/astra', tokens(0.02), { type: 'turn', turnId: 1 });
++    await session.usage.record(grandchild.agent, 'router/opus', tokens(0.03), { type: 'turn', turnId: 1 });
++
++    expect(billing.snapshot().total?.cost).toBeCloseTo(0.07);
++    expect(billing.snapshot().byModel?.['router/opus']?.cost).toBeCloseTo(0.03);
++    expect(session.usage.status(main.agent).total).toEqual({ ...tokens(0.02, 200), output: 20 });
++    expect(events.at(-1)?.total?.cost).toBeCloseTo(0.07);
++
++    await child.close();
++    await grandchild.close();
++    expect(billing.snapshot().total?.cost).toBeCloseTo(0.07);
++
++    const background = await startAgent(session, 'agent-2');
++    await session.usage.record(background.agent, 'router/astra', tokens(0.04), { type: 'turn', turnId: 1 });
++    expect(events.at(-1)?.total?.cost).toBeCloseTo(0.11);
++    await background.close();
++    await main.close();
++    billing.dispose();
++
++    session.usage = new SessionUsageService();
++    const resumed = startBilling(session);
++    await resumed.billing.ready;
++    expect(resumed.billing.snapshot().total?.cost).toBeCloseTo(0.11);
++    expect(resumed.billing.snapshot().total?.inputOther).toBe(500);
++    expect(resumed.events).toHaveLength(1);
++
++    const mainAgain = await startAgent(session, 'main');
++    await session.usage.record(mainAgain.agent, 'router/astra', tokens(0.05), { type: 'turn', turnId: 2 });
++    const childAgain = await startAgent(session, 'agent-0');
++    await session.usage.record(childAgain.agent, 'router/astra', tokens(0.06), { type: 'turn', turnId: 2 });
++
++    expect(session.usage.status(mainAgain.agent).total?.cost).toBeCloseTo(0.07);
++    expect(resumed.billing.snapshot().total?.cost).toBeCloseTo(0.22);
++    expect(resumed.billing.snapshot().total?.inputOther).toBe(700);
++    expect(resumed.events.at(-1)?.total?.cost).toBeCloseTo(0.22);
++  });
++
++  it('lets a live agent win over its durable records read during the restore', async () => {
++    const session = createSession();
++    const main = await startAgent(session, 'main');
++    await session.usage.record(main.agent, 'm', tokens(1), { type: 'turn', turnId: 1 });
++    await main.dispatcher.flush();
++
++    let release!: () => void;
++    const gate = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    let durableRead!: () => void;
++    const readDone = new Promise<void>((resolve) => {
++      durableRead = resolve;
++    });
++    const gatedLog: IAppendLogStore = {
++      _serviceBrand: undefined,
++      onDidWrite: session.log.onDidWrite,
++      append: (scope, key, record, options) => {
++        session.log.append(scope, key, record, options);
++      },
++      rewrite: (scope, key, records, options) => session.log.rewrite(scope, key, records, options),
++      flush: () => session.log.flush(),
++      flushLog: (scope, key) => session.log.flushLog(scope, key),
++      close: () => session.log.close(),
++      acquire: (scope, key) => session.log.acquire(scope, key),
++      drainRetirements: () => session.log.drainRetirements(),
++      externallyModified: (scope, key) => session.log.externallyModified(scope, key),
++      bindWriteGuard: (scope, key, guard) => session.log.bindWriteGuard(scope, key, guard),
++      read: async function* <R>(scope: string, key: string) {
++        const records: R[] = [];
++        for await (const record of session.log.read<R>(scope, key)) records.push(record);
++        durableRead();
++        await gate;
++        yield* records;
++      },
++    };
++    const { billing, events } = startBilling(session, { log: gatedLog });
++    const ready = billing.ready;
++    await readDone;
++
++    await session.usage.record(main.agent, 'm', tokens(2), { type: 'turn', turnId: 2 });
++    expect(billing.snapshot()).toEqual({});
++    expect(events).toEqual([]);
++    release();
++    await ready;
++
++    expect(billing.snapshot().total?.cost).toBe(3);
++    expect(events.map((status) => status.total?.cost)).toEqual([3]);
++  });
++
++  it('reads nothing until session billing is asked for', async () => {
++    const session = createSession();
++    const main = await startAgent(session, 'main');
++    await session.usage.record(main.agent, 'm', tokens(1), { type: 'turn', turnId: 1 });
++    await main.close();
++    session.usage = new SessionUsageService();
++    const read = vi.spyOn(session.log, 'read');
++    const { billing, events } = startBilling(session);
++
++    expect(read).not.toHaveBeenCalled();
++    expect(billing.snapshot()).toEqual({});
++    await billing.ready;
++
++    expect(read).toHaveBeenCalledTimes(1);
++    expect(billing.snapshot().total?.cost).toBe(1);
++    expect(events.map((status) => status.total?.cost)).toEqual([1]);
++  });
++
++  it('ignores other agents\' records, reads damaged journals like the engine and hides malformed usage', async () => {
++    const session = createSession();
++    session.agentIds.push('main', 'agent-0');
++    await session.log.rewrite<WireRecord>(`${SESSION_SCOPE}/agents/main`, AGENT_WIRE_RECORD_KEY, [
++      { type: 'metadata', protocol_version: '1.5', created_at: 0 },
++      { type: 'usage.record', agentId: 'main', model: 'm', usage: tokens(1) },
++      { type: 'usage.record', model: 'm', usage: tokens(2) },
++      { type: 'usage.record', agentId: 'agent-9', model: 'm', usage: tokens(100) },
++      { type: 'context.append_message', message: { role: 'user', content: [] } },
++    ]);
++    const healthy = startBilling(session);
++    await healthy.billing.ready;
++    expect(healthy.billing.snapshot().total?.cost).toBe(3);
++
++    const line = (cost: number): string =>
++      JSON.stringify({ type: 'usage.record', agentId: 'agent-0', model: 'm', usage: tokens(cost) });
++    await session.storage.write(
++      `${SESSION_SCOPE}/agents/agent-0`,
++      AGENT_WIRE_RECORD_KEY,
++      new TextEncoder().encode(`${line(4)}\n{broken\n${line(5)}\n`),
++    );
++    const damaged = startBilling(session);
++    await damaged.billing.ready;
++    expect(damaged.billing.snapshot().total?.cost).toBe(7);
++
++    await session.storage.write(
++      `${SESSION_SCOPE}/agents/agent-0`,
++      AGENT_WIRE_RECORD_KEY,
++      new TextEncoder().encode(
++        `${line(4)}\n${JSON.stringify({ type: 'usage.record', agentId: 'agent-0', model: 'm', usage: { inputOther: 'x' } })}\n`,
++      ),
++    );
++    const malformed = startBilling(session);
++    await expect(malformed.billing.ready).resolves.toBeUndefined();
++    expect(malformed.billing.snapshot()).toEqual({});
++    expect(malformed.events).toEqual([{}]);
++  });
++
++  it('reads the durable usage of agents registered after the initial restore', async () => {
++    const session = createSession();
++    const child = await startAgent(session, 'agent-0');
++    await session.usage.record(child.agent, 'm', tokens(2), { type: 'turn', turnId: 1 });
++    await child.close();
++    session.agentIds.length = 0;
++    session.usage = new SessionUsageService();
++    const metadata = metadataOf(session);
++    const { billing, events } = startBilling(session, { metadata });
++    await billing.ready;
++    expect(billing.snapshot()).toEqual({ byModel: undefined, total: undefined });
++
++    session.agentIds.push('agent-0');
++    metadata.announceAgents();
++    metadata.announceAgents();
++    await expect.poll(() => billing.snapshot().total?.cost).toBe(2);
++
++    expect(events.map((status) => status.total?.cost)).toEqual([undefined, 2]);
++
++    await session.storage.write(
++      `${SESSION_SCOPE}/agents/agent-1`,
++      AGENT_WIRE_RECORD_KEY,
++      new TextEncoder().encode(`${JSON.stringify({ type: 'usage.record', model: 'm', usage: null })}\n`),
++    );
++    session.agentIds.push('agent-1');
++    metadata.announceAgents();
++    await expect.poll(() => events.length).toBe(3);
++    expect(events.at(-1)).toEqual({});
++    expect(billing.snapshot()).toEqual({});
++  });
++
++  it('hides the cost instead of failing when the session metadata cannot be read', async () => {
++    const session = createSession();
++    const { billing } = startBilling(session, {
++      metadata: metadataOf(session, () => Promise.reject(new Error('disk gone'))),
++    });
++    await expect(billing.ready).resolves.toBeUndefined();
++    expect(billing.snapshot()).toEqual({});
++  });
++
++  it('does not announce a usage record that leaves the snapshot unchanged', async () => {
++    const session = createSession();
++    const main = await startAgent(session, 'main');
++    const { billing, events } = startBilling(session);
++    await billing.ready;
++
++    await session.usage.record(main.agent, 'm', tokens(1), { type: 'turn', turnId: 1 });
++    await session.usage.record(main.agent, 'm', { ...tokens(0, 0), output: 0 }, { type: 'turn', turnId: 1 });
++
++    expect(events.map((status) => status.total?.cost)).toEqual([undefined, 1]);
++  });
++});
+diff --git a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
+index adb4300a81d6240d9edac6e246bc2274cb43841a..53cb68f5a2abff19e66c0f2a5b59e688d7233fec 100644
+--- a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
++++ b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
+@@ -37,6 +37,14 @@ describe('TokenUsage aggregation', () => {
+     expect(addUsage(emptyUsage(), emptyUsage()).cost).toBeUndefined();
+   });
+ 
++  it('keeps the cost unknown when either usage lacks a reported cost', () => {
++    const reported = { ...emptyUsage(), cost: 0.5 };
++    expect(addUsage(reported, emptyUsage())).not.toHaveProperty('cost');
++    expect(addUsage(emptyUsage(), reported)).not.toHaveProperty('cost');
++    expect(addUsage(addUsage(reported, emptyUsage()), reported)).not.toHaveProperty('cost');
++    expect(addUsage({ ...emptyUsage(), cost: 0 }, { ...emptyUsage(), cost: 0 }).cost).toBe(0);
++  });
++
+   it('inputTotal sums all input counters, grandTotal adds output', () => {
+     const usage = { inputOther: 5, output: 7, inputCacheRead: 11, inputCacheCreation: 13 };
+     expect(inputTotal(usage)).toBe(29);
+diff --git a/packages/klient/src/contract/agent/schemas.ts b/packages/klient/src/contract/agent/schemas.ts
+index 6a4c793d726a099a203b097e47216b447a8f212d..225060ebab7b2ea75a72a80780f3a43d0772db26 100644
+--- a/packages/klient/src/contract/agent/schemas.ts
++++ b/packages/klient/src/contract/agent/schemas.ts
+@@ -124,6 +124,7 @@ export const tokenUsageSchema = z.object({
+   output: z.number(),
+   inputCacheRead: z.number(),
+   inputCacheCreation: z.number(),
++  cost: z.number().optional(),
+ });
+ 
+ export const usageStatusSchema = z.object({
+diff --git a/packages/node-sdk/src/sdk-rpc-client-v2.ts b/packages/node-sdk/src/sdk-rpc-client-v2.ts
+index 4051b61d0545ae48e099322787b019c560eec821..f01ab39c43dfc915807dd710266335eb0b861c59 100644
+--- a/packages/node-sdk/src/sdk-rpc-client-v2.ts
++++ b/packages/node-sdk/src/sdk-rpc-client-v2.ts
+@@ -165,6 +165,7 @@ import {
+   IAgentSwarmService,
+   IAgentTaskService,
+   ISessionTokenCountingService,
++  ISessionBillingService,
+   IAgentToolPolicyService,
+   IAgentToolRegistryService,
+   type HostUiCapability,
+@@ -1985,6 +1986,10 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
+    */
+   override async getStatus(input: SessionIdRpcInput): Promise<SessionStatus> {
+     const agent = await this.agentScope(input.sessionId);
++    // Session billing reads every agent's durable usage once; wait for it
++    // before the other slices so all of them describe the same moment.
++    const billing = agent.accessor.get(ISessionBillingService);
++    await billing.ready;
+     const facade = this.klient.session(input.sessionId).agent(this.interactiveAgentId);
+     const [context, plan, usage] = await Promise.all([
+       facade.getContext(),
+@@ -2011,6 +2016,7 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
+       maxContextTokens,
+       contextUsage,
+       usage: hasUsage ? usage : undefined,
++      billingUsage: billing.snapshot(),
+     };
+   }
+ 
+diff --git a/packages/node-sdk/src/types.ts b/packages/node-sdk/src/types.ts
+index 5b06fae432409ec574990d027492444b217b8876..ee0f1f9af623df46b0b74be0381596e860e005be 100644
+--- a/packages/node-sdk/src/types.ts
++++ b/packages/node-sdk/src/types.ts
+@@ -427,7 +427,16 @@ export interface SessionStatus {
+   readonly contextTokens: number;
+   readonly maxContextTokens: number;
+   readonly contextUsage: number;
++  /** Token usage of the session's interactive agent only. */
+   readonly usage?: SessionUsage;
++  /**
++   * Token usage of every agent in the session (main agent, foreground,
++   * background and nested subagents, including finished ones), each counted
++   * once. For pricing only; it says nothing about any agent's context. Empty
++   * both before anything is spent and while the session's usage cannot be
++   * fully accounted for.
++   */
++  readonly billingUsage?: SessionUsage;
+ }
+ 
+ /**
+diff --git a/packages/node-sdk/src/v2/session-wiring.ts b/packages/node-sdk/src/v2/session-wiring.ts
+index 5c8969313794c0dd03627ad1b45a9c604794c63f..7b8cd360afcac570688470f4bf2b49ff326d35d1 100644
+--- a/packages/node-sdk/src/v2/session-wiring.ts
++++ b/packages/node-sdk/src/v2/session-wiring.ts
+@@ -35,6 +35,7 @@ import {
+   interactions,
+   ISessionTokenCountingService,
+   ISessionUsageService,
++  ISessionBillingService,
+   MAIN_AGENT_ID,
+   toDisposable,
+   type Event2,
+@@ -114,6 +115,29 @@ export class SessionEventWiring {
+     private readonly sink: SessionEventSink,
+   ) {
+     const manager = session.accessor.get(IAgentLifecycleService);
++    // Session-wide billing (every agent of the session, counted once) changes
++    // whenever any agent records usage — also a background subagent after the
++    // main turn ended. It rides a main-agent status event that carries the
++    // main agent's own snapshot like every other status event, plus
++    // `billingUsage`; child usage never reaches the main agent's fields.
++    const billing = session.accessor.get(ISessionBillingService) as
++      | ISessionBillingService
++      | undefined;
++    if (billing !== undefined) {
++      this.disposables.push(
++        billing.onDidChange((billingUsage) => {
++          const main = manager.handleOf(MAIN_AGENT_ID);
++          if (this.disposed || main === undefined) return;
++          const event = withStatusSnapshot(main, {
++            type: 'agent.status.updated',
++            agentId: MAIN_AGENT_ID,
++            billingUsage,
++          } as unknown as Event2<any>);
++          const translated = translateDomainEvent(event, session.id, MAIN_AGENT_ID);
++          if (translated !== undefined) this.sink.receiveEvent(translated);
++        }),
++      );
++    }
+     this.disposables.push(
+       toDisposable(
+         interactions.onDidChangePending(() => {
+diff --git a/packages/node-sdk/test/session-billing.test.ts b/packages/node-sdk/test/session-billing.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a740b2a9b125fa63d2d355176eec7a27e605dfce
+--- /dev/null
++++ b/packages/node-sdk/test/session-billing.test.ts
+@@ -0,0 +1,294 @@
++/**
++ * Scenario: session-wide billing on the v2 engine — every agent's usage (main
++ * agent, foreground and background subagents, finished ones too) is billed
++ * once, live and after a resume, while the main agent's own usage and
++ * context stay agent-local.
++ * Wiring: real v2 engine bootstrapped on a temp home. The live case drives
++ * real subagents through a stubbed Chat Completions endpoint; the resume case
++ * also writes records in the persisted wire format the engine appends.
++ * Run: pnpm exec vitest run test/session-billing.test.ts
++ */
++import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { createKimiHarness, SDKRpcClientV2, type Event, type Session } from '#/index';
++import { drainQueryStoreDisposals, drainSessionIndexMirror, MAIN_AGENT_ID } from '@moonshot-ai/agent-core-v2';
++
++import { TEST_IDENTITY } from './test-identity';
++
++const tempDirs: string[] = [];
++
++afterEach(async () => {
++  await drainSessionIndexMirror();
++  await drainQueryStoreDisposals();
++  for (const dir of tempDirs.splice(0)) {
++    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
++  }
++});
++
++async function findSessionDir(homeDir: string, sessionId: string): Promise<string> {
++  for (const bucket of await readdir(join(homeDir, 'sessions'))) {
++    const candidate = join(homeDir, 'sessions', bucket, sessionId);
++    try {
++      await readdir(candidate);
++      return candidate;
++    } catch {
++      // Not under this bucket.
++    }
++  }
++  throw new Error(`no persisted directory found for session ${sessionId}`);
++}
++
++function usageLine(agentId: string, model: string, cost: number): string {
++  return `${JSON.stringify({
++    type: 'usage.record',
++    agentId,
++    model,
++    usage: { inputOther: 100, output: 10, inputCacheRead: 0, inputCacheCreation: 0, cost },
++    usageScope: 'turn',
++    time: 1,
++  })}\n`;
++}
++
++async function appendWire(homedir: string, lines: readonly string[]): Promise<void> {
++  await mkdir(homedir, { recursive: true });
++  const wirePath = join(homedir, 'wire.jsonl');
++  const existing = await readFile(wirePath, 'utf-8').catch(() => undefined);
++  const metadata = `${JSON.stringify({ type: 'metadata', protocol_version: '1.5', created_at: 1 })}\n`;
++  await (existing === undefined
++    ? writeFile(wirePath, metadata + lines.join(''), 'utf-8')
++    : appendFile(wirePath, lines.join(''), 'utf-8'));
++}
++
++async function addSubagent(
++  sessionDir: string,
++  agentId: string,
++  parentAgentId: string,
++  lines: readonly string[],
++): Promise<void> {
++  const homedir = join(sessionDir, 'agents', agentId);
++  await appendWire(homedir, lines);
++  const statePath = join(sessionDir, 'state.json');
++  const state = JSON.parse(await readFile(statePath, 'utf-8')) as {
++    agents?: Record<string, unknown>;
++  };
++  state.agents = { ...state.agents, [agentId]: { homedir, type: 'sub', parentAgentId } };
++  await writeFile(statePath, JSON.stringify(state), 'utf-8');
++}
++
++describe('session billing over the v2 engine', () => {
++  it('bills every persisted agent once after a resume and leaves the main agent usage alone', async () => {
++    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-billing-'));
++    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-billing-work-'));
++    tempDirs.push(homeDir, workDir);
++    const client = new SDKRpcClientV2({ homeDir, identity: TEST_IDENTITY });
++
++    try {
++      await client.createSession({ id: 'ses_billing', workDir });
++      await client.closeSession({ sessionId: 'ses_billing' });
++      const sessionDir = await findSessionDir(homeDir, 'ses_billing');
++      await appendWire(join(sessionDir, 'agents', MAIN_AGENT_ID), [
++        usageLine(MAIN_AGENT_ID, 'router/astra', 0.01),
++        usageLine(MAIN_AGENT_ID, 'router/astra', 0.02),
++      ]);
++      await addSubagent(sessionDir, 'agent-0', MAIN_AGENT_ID, [usageLine('agent-0', 'router/astra', 0.04)]);
++      await addSubagent(sessionDir, 'agent-1', 'agent-0', [
++        usageLine('agent-1', 'router/opus', 0.08),
++        usageLine('agent-1', 'router/opus', 0.16),
++      ]);
++
++      await client.resumeSession({ id: 'ses_billing' });
++      const status = await client.getStatus({ sessionId: 'ses_billing' });
++
++      expect(status.usage?.total?.cost).toBeCloseTo(0.03);
++      expect(status.usage?.total?.inputOther).toBe(200);
++      expect(status.billingUsage?.total?.cost).toBeCloseTo(0.31);
++      expect(status.billingUsage?.total?.inputOther).toBe(500);
++      expect(status.billingUsage?.byModel?.['router/astra']?.cost).toBeCloseTo(0.07);
++      expect(status.billingUsage?.byModel?.['router/opus']?.cost).toBeCloseTo(0.24);
++      expect(status.contextTokens).toBe(0);
++
++      const again = await client.getStatus({ sessionId: 'ses_billing' });
++      expect(again.billingUsage).toEqual(status.billingUsage);
++    } finally {
++      await client.close();
++    }
++  });
++
++  it('bills foreground and background subagents live, after the main turn and after a restart', async () => {
++    const homeDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-billing-live-'));
++    const workDir = await mkdtemp(join(tmpdir(), 'kimi-sdk-billing-live-work-'));
++    tempDirs.push(homeDir, workDir);
++    const ledger = { main: 0, child: 0, background: 0 };
++    let releaseBackground!: () => void;
++    const backgroundGate = new Promise<void>((resolve) => {
++      releaseBackground = resolve;
++    });
++    let mainRequests = 0;
++    const fetchStub = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
++      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++      if (url !== MODEL_URL) throw new Error(`Unexpected fetch: ${url}`);
++      const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
++        readonly messages?: ReadonlyArray<{ readonly role: string; readonly content: unknown }>;
++      };
++      // Each agent's conversation starts with its own task.
++      const task = JSON.stringify(body.messages?.find((message) => message.role === 'user')?.content);
++      if (task.includes('CHILD-BACKGROUND')) {
++        await backgroundGate;
++        return completion('background done', 'background', 0.04, ledger);
++      }
++      if (task.includes('CHILD-FOREGROUND')) return completion('child done', 'child', 0.02, ledger);
++      mainRequests += 1;
++      if (mainRequests === 1) return agentCall('CHILD-FOREGROUND', false, ledger);
++      if (mainRequests === 2) return agentCall('CHILD-BACKGROUND', true, ledger);
++      return completion('all done', 'main', 0.01, ledger);
++    });
++    let harness = createKimiHarness({ identity: TEST_IDENTITY, homeDir });
++    try {
++      await configureFakeProvider(harness);
++      let session = await harness.createSession({ id: 'ses_billing_live', workDir, permission: 'yolo' });
++      const events: Event[] = [];
++      const unsubscribe = session.onEvent((event) => events.push(event));
++      const mainTurnsEnded = (): number =>
++        events.filter((event) => event.type === 'turn.ended' && event.agentId === 'main').length;
++
++      await session.prompt('Delegate the work.');
++      await waitFor(() => mainTurnsEnded() === 1);
++      const beforeBackground = await session.getStatus();
++      expect(beforeBackground.billingUsage?.total?.cost).toBeCloseTo(ledger.main + ledger.child);
++      expect(beforeBackground.billingUsage?.byModel?.['fake-child']?.cost).toBeCloseTo(ledger.child);
++      expect(beforeBackground.usage?.total?.cost).toBeCloseTo(ledger.main);
++      expect(beforeBackground.maxContextTokens).toBe(262144);
++
++      let mainCostAtEvent = Number.NaN;
++      const billed = waitForEvent(session, (event) => {
++        if (event.type !== 'agent.status.updated' || event.billingUsage === undefined) return false;
++        if (Math.abs((event.billingUsage.total?.cost ?? 0) - (ledger.main + ledger.child + 0.04)) > 1e-9) {
++          return false;
++        }
++        mainCostAtEvent = ledger.main;
++        return true;
++      });
++      releaseBackground();
++      const afterBackground = await billed;
++      if (afterBackground.type !== 'agent.status.updated') throw new Error('unexpected event');
++      expect(afterBackground.agentId).toBe('main');
++      expect(afterBackground.usage?.total?.cost).toBeCloseTo(mainCostAtEvent);
++      expect(afterBackground.maxContextTokens).toBe(262144);
++      expect(afterBackground.billingUsage?.byModel?.['fake-child']?.cost).toBeCloseTo(ledger.child + 0.04);
++
++      // The finished background task starts one more main turn; wait for it to settle.
++      await waitFor(() => mainTurnsEnded() === 2);
++      unsubscribe();
++      const status = (event: Event): { maxContextTokens?: number } | undefined =>
++        event.type === 'agent.status.updated' && event.maxContextTokens !== undefined ? event : undefined;
++      const mainLimits = new Set(events.filter((event) => event.agentId === 'main').map((event) => status(event)?.maxContextTokens));
++      const childLimits = new Set(events.filter((event) => event.agentId !== 'main').map((event) => status(event)?.maxContextTokens));
++      mainLimits.delete(undefined);
++      childLimits.delete(undefined);
++      expect(mainLimits).toEqual(new Set([262144]));
++      expect(childLimits).toEqual(new Set([100000]));
++
++      const total = ledger.main + ledger.child + ledger.background;
++      const settled = await session.getStatus();
++      expect(settled.billingUsage?.total?.cost).toBeCloseTo(total);
++      expect(settled.usage?.total?.cost).toBeCloseTo(ledger.main);
++
++      await session.close();
++      await harness.close();
++      harness = createKimiHarness({ identity: TEST_IDENTITY, homeDir });
++      session = await harness.resumeSession({ id: 'ses_billing_live' });
++      const resumed = await session.getStatus();
++      expect(resumed.billingUsage?.total?.cost).toBeCloseTo(total);
++      expect(resumed.usage?.total?.cost).toBeCloseTo(ledger.main);
++    } finally {
++      fetchStub.mockRestore();
++      releaseBackground();
++      await harness.close();
++    }
++  });
++});
++
++const MODEL_URL = 'https://model.example.test/v1/chat/completions';
++
++type Ledger = Record<'main' | 'child' | 'background', number>;
++
++function sse(chunks: readonly Record<string, unknown>[]): Response {
++  const body = [...chunks.map((chunk) => `data: ${JSON.stringify(chunk)}`), 'data: [DONE]']
++    .map((line) => `${line}\n\n`)
++    .join('');
++  return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
++}
++
++function chunk(delta: Record<string, unknown>, finishReason: string | null = null): Record<string, unknown> {
++  return { id: 'chatcmpl-stub', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta, finish_reason: finishReason }] };
++}
++
++function usage(cost: number): Record<string, unknown> {
++  return { id: 'chatcmpl-stub', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, cost } };
++}
++
++function completion(text: string, role: keyof Ledger, cost: number, ledger: Ledger): Response {
++  ledger[role] += cost;
++  return sse([chunk({ role: 'assistant', content: text }), chunk({}, 'stop'), usage(cost)]);
++}
++
++function agentCall(prompt: string, background: boolean, ledger: Ledger): Response {
++  ledger.main += 0.01;
++  return sse([
++    chunk({
++      role: 'assistant',
++      tool_calls: [
++        {
++          index: 0,
++          id: `call-${prompt}`,
++          type: 'function',
++          function: {
++            name: 'Agent',
++            arguments: JSON.stringify({ description: prompt, prompt, run_in_background: background }),
++          },
++        },
++      ],
++    }),
++    chunk({}, 'tool_calls'),
++    usage(0.01),
++  ]);
++}
++
++async function configureFakeProvider(harness: ReturnType<typeof createKimiHarness>): Promise<void> {
++  await harness.setConfig({
++    providers: { local: { type: 'openai', baseUrl: 'https://model.example.test/v1', apiKey: 'sk-test' } },
++    models: {
++      'fake-model': { provider: 'local', model: 'fake-model', maxContextSize: 262144 },
++      'fake-child': { provider: 'local', model: 'fake-child', maxContextSize: 100000 },
++    },
++    defaultModel: 'fake-model',
++    secondaryModel: { defaultModel: 'fake-child' },
++  });
++}
++
++function waitForEvent(session: Session, predicate: (event: Event) => boolean): Promise<Event> {
++  return new Promise((resolve, reject) => {
++    const timeout = setTimeout(() => {
++      unsubscribe();
++      reject(new Error('Timed out waiting for session event'));
++    }, 10_000);
++    const unsubscribe = session.onEvent((event) => {
++      if (!predicate(event)) return;
++      clearTimeout(timeout);
++      unsubscribe();
++      resolve(event);
++    });
++  });
++}
++
++async function waitFor(check: () => boolean): Promise<void> {
++  const deadline = Date.now() + 10_000;
++  while (!check()) {
++    if (Date.now() > deadline) throw new Error('Timed out waiting for the session');
++    await new Promise((resolve) => setTimeout(resolve, 10));
++  }
++}
+diff --git a/packages/node-sdk/test/session-event-wiring.test.ts b/packages/node-sdk/test/session-event-wiring.test.ts
+index 34f8f2f3c9e98d4731733b4e138e20619784dbe6..361fa103ef887674bca52771f462a8351046c557 100644
+--- a/packages/node-sdk/test/session-event-wiring.test.ts
++++ b/packages/node-sdk/test/session-event-wiring.test.ts
+@@ -16,6 +16,7 @@ import {
+   IEventBus,
+   ISessionTokenCountingService,
+   ISessionUsageService,
++  ISessionBillingService,
+   makeAgentScopeContext,
+   type ISessionScopeHandle,
+ } from '@moonshot-ai/agent-core-v2';
+@@ -65,7 +66,10 @@ class FakeAgentHandle {
+   dispose(): void {}
+ }
+ 
+-function makeSession(agents: FakeAgentHandle[]): ISessionScopeHandle {
++function makeSession(
++  agents: FakeAgentHandle[],
++  sessionServices = new Map<unknown, unknown>(),
++): ISessionScopeHandle {
+   const lifecycle = {
+     list: () => agents.map((agent) => agent.context),
+     get: (agentId: string) => agents.find((agent) => agent.id === agentId)?.context,
+@@ -76,7 +80,7 @@ function makeSession(agents: FakeAgentHandle[]): ISessionScopeHandle {
+   const accessor = {
+     get: (token: unknown): unknown => {
+       if (token === IAgentLifecycleService) return lifecycle;
+-      return undefined;
++      return sessionServices.get(token);
+     },
+   };
+   return { id: 's1', kind: 1, accessor, dispose: () => {} } as unknown as ISessionScopeHandle;
+@@ -101,6 +105,10 @@ const USAGE = {
+   total: { inputOther: 1, output: 2, inputCacheRead: 0, inputCacheCreation: 0, cost: 0.25 },
+ };
+ 
++const BILLING = {
++  total: { inputOther: 9, output: 4, inputCacheRead: 0, inputCacheCreation: 0, cost: 0.75 },
++};
++
+ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
+   agent.set(ISessionTokenCountingService, { statusSize: () => 10 });
+   agent.set(IAgentProfileService, {
+@@ -115,6 +123,63 @@ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
+ // ---------------------------------------------------------------------------
+ 
+ describe('SessionEventWiring status snapshot fold', () => {
++  it('forwards session billing on a main-agent status event that keeps the main snapshot', () => {
++    const listeners = new Set<(usage: typeof BILLING) => void>();
++    const billing = {
++      onDidChange: (listener: (usage: typeof BILLING) => void) => {
++        listeners.add(listener);
++        return { dispose: () => listeners.delete(listener) };
++      },
++    };
++    const main = new FakeAgentHandle('main');
++    bindStatusServices(main, 'main-model');
++    const { sink, events } = collectingSink();
++    const wiring = new SessionEventWiring(
++      makeSession([main], new Map<unknown, unknown>([[ISessionBillingService, billing]])),
++      sink,
++    );
++
++    for (const listener of listeners) listener(BILLING);
++    wiring.dispose();
++    for (const listener of listeners) listener(BILLING);
++
++    expect(events).toEqual([
++      {
++        type: 'agent.status.updated',
++        sessionId: 's1',
++        agentId: 'main',
++        billingUsage: BILLING,
++        usage: USAGE,
++        contextTokens: 10,
++        maxContextTokens: 128_000,
++        contextUsage: 10 / 128_000,
++        model: 'main-model',
++      },
++    ]);
++    expect(listeners.size).toBe(0);
++  });
++
++  it('drops a billing update while the session has no main agent', () => {
++    let notify: ((usage: typeof BILLING) => void) | undefined;
++    const billing = {
++      onDidChange: (listener: (usage: typeof BILLING) => void) => {
++        notify = listener;
++        return { dispose: () => {} };
++      },
++    };
++    const { sink, events } = collectingSink();
++    const wiring = new SessionEventWiring(
++      makeSession([], new Map<unknown, unknown>([[ISessionBillingService, billing]])),
++      sink,
++    );
++    try {
++      notify?.(BILLING);
++    } finally {
++      wiring.dispose();
++    }
++    expect(events).toEqual([]);
++  });
++
+   it('folds a consistent usage + context + model snapshot into every status event', () => {
+     const sub = new FakeAgentHandle('agent-1');
+     bindStatusServices(sub, 'sub-model');
+-- 
+2.50.1 (Apple Git-155)
+

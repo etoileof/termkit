@@ -1,0 +1,2621 @@
+From 170f3bdbda097f5182d994828540c6dd5f21a470 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Fri, 16 Oct 2026 13:20:02 +0200
+Subject: [PATCH 06/13] customkimi: refresh CloseRouter model limits and
+ endpoint efforts
+
+At startup (and on the server's scheduled refresh), configured aliases whose endpoint is CloseRouter take context_length and max_output_tokens from GET /v1/models and the supported_reasoning_efforts of the endpoint they are actually called through (Chat Completions, Responses or Messages, following per-model base_url and protocol overrides) from GET /v1/models/{author}/{model}/endpoints. The catalog is never imported. Chat and Responses endpoints without a none effort become always_thinking so "off" is never offered or sent; Messages keeps native Anthropic thinking. Requests go only to api.closerouter.dev with redirects refused, are bounded (4 at once, 10 s each, 30 s total) and never put the key in a message. A provider's key is sent only when that provider itself points at CloseRouter; an alias that merely re-routes another provider there is skipped and reported. Failures keep the last-good values and are reported; metadata that would invalidate [secondary_model].default_effort is kept back and reported. The patch is merged into a freshly read config, only the models section is written, and [models."<alias>".overrides] are never touched. The TUI shows what changed and re-reads the active model's context limit and effort after a refresh, and its pre-session footer uses the effective limits.
+---
+ .changeset/closerouter-model-metadata.md      |   5 +
+ .../src/tui/controllers/auth-flow.ts          |   5 +-
+ apps/kimi-code/src/tui/kimi-tui.ts            |  34 +
+ apps/kimi-code/src/tui/utils/model-switch.ts  |  25 +-
+ .../src/tui/utils/thinking-config.ts          |  37 +-
+ .../test/tui/kimi-tui-startup.test.ts         | 130 +++
+ .../test/tui/utils/thinking-config.test.ts    |  50 +
+ .../src/app/kosongConfig/discovery.ts         |   1 +
+ .../src/app/kosongConfig/discoveryService.ts  |   6 +
+ .../model/closerouterRequests.test.ts         | 320 +++++++
+ packages/klient/src/contract/global/events.ts |   1 +
+ .../src/contract/global/providerDiscovery.ts  |   1 +
+ .../node-sdk/test/sdk-rpc-client-v2.test.ts   |  48 +
+ packages/oauth/src/closerouter.ts             | 761 +++++++++++++++
+ packages/oauth/src/refreshProviderModels.ts   |  31 +
+ packages/oauth/test/closerouter.test.ts       | 902 ++++++++++++++++++
+ 16 files changed, 2339 insertions(+), 18 deletions(-)
+ create mode 100644 .changeset/closerouter-model-metadata.md
+ create mode 100644 packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
+ create mode 100644 packages/oauth/src/closerouter.ts
+ create mode 100644 packages/oauth/test/closerouter.test.ts
+
+diff --git a/.changeset/closerouter-model-metadata.md b/.changeset/closerouter-model-metadata.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3701e1620f6b2fb17810e23fcffdbc60a534cdc4
+--- /dev/null
++++ b/.changeset/closerouter-model-metadata.md
+@@ -0,0 +1,5 @@
++---
++"@moonshot-ai/kimi-code": minor
++---
++
++Refresh CloseRouter models' context limits, output limits, and reasoning efforts from CloseRouter at startup, replacing those values in config.toml; keep your own under `[models."<alias>".overrides]`.
+diff --git a/apps/kimi-code/src/tui/controllers/auth-flow.ts b/apps/kimi-code/src/tui/controllers/auth-flow.ts
+index 191e1aa3e770126146bfae31545fc6a8ff448fa6..9e1e84903e1bf3f0e40bc914382be25d269fdb15 100644
+--- a/apps/kimi-code/src/tui/controllers/auth-flow.ts
++++ b/apps/kimi-code/src/tui/controllers/auth-flow.ts
+@@ -11,7 +11,7 @@ import {
+ } from '../commands/config';
+ import type { SlashCommandHost } from '../commands/dispatch';
+ import { OAUTH_LOGIN_REQUIRED_STARTUP_NOTICE } from '../constant/kimi-tui';
+-import { thinkingEffortFromConfig } from '../utils/thinking-config';
++import { configuredModelDefaults, thinkingEffortFromConfig } from '../utils/thinking-config';
+ import type { AppState, KimiTUIOptions } from '../types';
+ 
+ export interface AuthFlowHost {
+@@ -144,7 +144,8 @@ export class AuthFlowController {
+       availableModels,
+       availableProviders,
+       model: defaultModel,
+-      maxContextTokens: selected.maxContextSize,
++      maxContextTokens:
++        configuredModelDefaults(config, defaultModel).maxContextTokens ?? selected.maxContextSize,
+     };
+     host.setAppState(appStatePatch);
+     return activated;
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index 8c270056fe14c69f50bdf82f18c069f000721c5c..62a3fee61cdb09eaf4e887feb11039d578005f84 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -201,6 +201,7 @@ import { isSessionOccupiedError } from './utils/session-lock-errors';
+ import { formatStepRetryDetail, formatStepRetryLabel } from './utils/step-retry';
+ import { formatBashOutputForDisplay } from './utils/shell-output';
+ import { lazyModelSelection } from './utils/model-switch';
++import { configuredModelDefaults } from './utils/thinking-config';
+ import { combineStartupNotice, isOAuthLoginRequiredError } from './utils/startup';
+ import { installTerminalFocusTracking } from './utils/terminal-focus';
+ import { notifyTerminalOnce } from './utils/terminal-notification';
+@@ -858,6 +859,8 @@ export class KimiTUI {
+     try {
+       const result = await this.authFlow.refreshProviderModels();
+       for (const c of result.changed) {
++        // A refresh that rewrites configured values (CloseRouter limits and efforts) says so.
++        if (c.detail !== undefined) this.showStatus(`${c.provider_name} · ${c.detail}.`);
+         if (c.added <= 0) continue;
+         this.showStatus(`${c.provider_name} · +${String(c.added)} model${c.added > 1 ? 's' : ''}.`);
+       }
+@@ -867,6 +870,7 @@ export class KimiTUI {
+       if (result.retired_default !== undefined) {
+         await this.modelMigration.retire(result.retired_default);
+       }
++      if (result.changed.length > 0) await this.applyRefreshedModelLimits();
+     } catch {
+       // Best-effort: startup must not crash on background refresh failures.
+     }
+@@ -894,6 +898,36 @@ export class KimiTUI {
+     } catch {}
+   }
+ 
++  /**
++   * A refresh can change the active model's limits or efforts (CloseRouter
++   * metadata). Re-read what the engine now resolves so the context meter and
++   * the thinking label follow at once instead of at the next status event.
++   */
++  private async applyRefreshedModelLimits(): Promise<void> {
++    const session = this.session;
++    if (session !== undefined) {
++      const status = await session.getStatus();
++      if (this.session !== session) return;
++      const { contextTokens } = this.state.appState;
++      this.setAppState({
++        maxContextTokens: status.maxContextTokens,
++        contextUsage: status.maxContextTokens > 0 ? contextTokens / status.maxContextTokens : 0,
++        thinkingEffort: status.thinkingEffort,
++      });
++      return;
++    }
++    const alias = this.state.appState.model;
++    if (alias.length === 0) return;
++    const defaults = configuredModelDefaults(await this.harness.getConfig(), alias);
++    if (this.session !== undefined || this.state.appState.model !== alias) return;
++    const patch: Partial<AppState> = {};
++    if (defaults.maxContextTokens !== undefined) patch.maxContextTokens = defaults.maxContextTokens;
++    if (defaults.thinkingEffort !== undefined && this.state.appState.lazySessionThinking === undefined) {
++      patch.thinkingEffort = defaults.thinkingEffort;
++    }
++    this.setAppState(patch);
++  }
++
+   private async finishStartup(shouldReplayHistory: boolean): Promise<void> {
+     if (this.startupNotice !== undefined) {
+       this.showStatus(this.startupNotice);
+diff --git a/apps/kimi-code/src/tui/utils/model-switch.ts b/apps/kimi-code/src/tui/utils/model-switch.ts
+index 2c7c182b96d7fe9d2c02330f77ac3e4dba1d26e5..8f60249ff8b0ec7f7c85e3acf21acf5e61d4c3da 100644
+--- a/apps/kimi-code/src/tui/utils/model-switch.ts
++++ b/apps/kimi-code/src/tui/utils/model-switch.ts
+@@ -6,10 +6,10 @@ import {
+ } from '@moonshot-ai/kimi-code-sdk';
+ 
+ import type { SlashCommandHost } from '../commands/dispatch';
+-import { defaultThinkingEffortFor, modelDisplayName } from '../components/dialogs/model-selector';
++import { modelDisplayName } from '../components/dialogs/model-selector';
+ import type { AppState } from '../types';
+ import { formatErrorMessage } from './event-payload';
+-import { thinkingEffortFromConfig, thinkingEffortToConfig } from './thinking-config';
++import { configuredModelDefaults, thinkingEffortToConfig } from './thinking-config';
+ 
+ export const MODEL_SWITCH_CACHE_WARNING =
+   'Note: Switching models invalidates the existing prompt cache. Use /new to avoid extra token costs.';
+@@ -46,20 +46,15 @@ export function lazyModelSelection(
+   // first lazy-created session.
+   const patch: Partial<AppState> =
+     alias === undefined ? { model: '', maxContextTokens: 0 } : { model: alias };
+-  const raw = alias === undefined ? undefined : config.models?.[alias];
+-  if (raw?.maxContextSize !== undefined) {
+-    patch.maxContextTokens = raw.maxContextSize;
++  // Mirror the engine, which resolves both at createSession time: the
++  // effective context limit (overrides applied) and the configured effort,
++  // else the model's default one.
++  const defaults = configuredModelDefaults(config, alias ?? '');
++  if (alias !== undefined && defaults.maxContextTokens !== undefined) {
++    patch.maxContextTokens = defaults.maxContextTokens;
+   }
+-  const effort = thinkingEffortFromConfig(config.thinking);
+-  if (effort !== undefined) {
+-    patch.thinkingEffort = effort;
+-  } else if (raw !== undefined) {
+-    // No concrete effort configured: mirror the engine, which resolves the
+-    // model's default effort at createSession time.
+-    const providerType = config.providers?.[raw.provider]?.type;
+-    patch.thinkingEffort = defaultThinkingEffortFor(
+-      effectiveModelAlias(raw, providerType ?? raw.protocol),
+-    );
++  if (defaults.thinkingEffort !== undefined) {
++    patch.thinkingEffort = defaults.thinkingEffort;
+   }
+   return patch;
+ }
+diff --git a/apps/kimi-code/src/tui/utils/thinking-config.ts b/apps/kimi-code/src/tui/utils/thinking-config.ts
+index 79dff432398d8822c14a1dfcaf24eadc302260ed..b5d3eca30639b5fa339cb8bdd425143182214aa1 100644
+--- a/apps/kimi-code/src/tui/utils/thinking-config.ts
++++ b/apps/kimi-code/src/tui/utils/thinking-config.ts
+@@ -1,4 +1,11 @@
+-import type { ModelAlias, ThinkingEffort } from '@moonshot-ai/kimi-code-sdk';
++import {
++  effectiveModelAlias,
++  type KimiConfig,
++  type ModelAlias,
++  type ThinkingEffort,
++} from '@moonshot-ai/kimi-code-sdk';
++
++import { defaultThinkingEffortFor } from '../components/dialogs/model-selector';
+ 
+ /** Whether a thinking effort represents "thinking enabled" (anything but 'off'). */
+ export function isThinkingOn(effort: ThinkingEffort): boolean {
+@@ -58,3 +65,31 @@ export function thinkingEffortFromConfig(
+   if (config?.enabled === false) return 'off';
+   return config?.effort;
+ }
++
++/**
++ * What a session created from config would start with on `alias`, for the
++ * footer before the session exists. Mirrors the engine: the context limit is
++ * the effective one (overrides and `max_input_size` applied), and a model
++ * that cannot stop reasoning runs at the configured — else its default —
++ * effort even when `[thinking]` is disabled.
++ */
++export function configuredModelDefaults(
++  config: Pick<KimiConfig, 'models' | 'providers' | 'thinking'>,
++  alias: string,
++): { readonly maxContextTokens?: number; readonly thinkingEffort?: ThinkingEffort } {
++  const configured = thinkingEffortFromConfig(config.thinking);
++  const raw = config.models?.[alias];
++  if (raw === undefined) return { thinkingEffort: configured };
++  const model = effectiveModelAlias(raw, config.providers?.[raw.provider]?.type ?? raw.protocol);
++  const alwaysThinking = model.capabilities?.includes('always_thinking') === true;
++  const effort = config.thinking?.effort;
++  return {
++    maxContextTokens: model.maxInputSize ?? model.maxContextSize,
++    thinkingEffort:
++      configured === undefined || (configured === 'off' && alwaysThinking)
++        ? effort !== undefined && effort !== 'off'
++          ? effort
++          : defaultThinkingEffortFor(model)
++        : configured,
++  };
++}
+diff --git a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+index 8141ba4bbc900f9aef8fdefe57b772c3c9b22028..6985fb0b96ca05c11e048528d107859a47fe3532 100644
+--- a/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
++++ b/apps/kimi-code/test/tui/kimi-tui-startup.test.ts
+@@ -859,6 +859,136 @@ describe('KimiTUI startup', () => {
+     expect(driver.state.appState.permissionMode).toBe('auto');
+   });
+ 
++  describe('CloseRouter metadata refresh', () => {
++    // The engine's startup refresh (oauth refreshCloseRouterModels) rewrites the
++    // alias from CloseRouter's catalog and endpoint and reports it with a detail.
++    function closeRouterHarness(
++      session = makeSession(),
++      overrides: Record<string, unknown> = {},
++      refreshGate?: Promise<void>,
++    ) {
++      let config: Record<string, unknown> = {
++        providers: {
++          closerouter: { type: 'openai', baseUrl: 'https://api.closerouter.dev/v1', apiKeyEnv: 'CLOSEROUTER_STARTUP_KEY' },
++        },
++        models: { astra: { provider: 'closerouter', model: 'openai/gpt-6-astra', maxContextSize: 1_000_000 } },
++        defaultModel: 'astra',
++        thinking: { enabled: false, effort: 'high' },
++      };
++      return makeHarness(session, {
++        getConfig: vi.fn(async () => structuredClone(config)),
++        refreshProviderModels: vi.fn(async () => {
++          await refreshGate;
++          config = {
++            ...config,
++            models: {
++              astra: {
++                provider: 'closerouter',
++                model: 'openai/gpt-6-astra',
++                maxContextSize: 786_432,
++                maxOutputSize: 128_000,
++                capabilities: ['thinking', 'always_thinking'],
++                supportEfforts: ['low', 'high', 'max'],
++                defaultEffort: 'high',
++              },
++            },
++          };
++          return {
++            changed: [
++              {
++                provider_id: 'closerouter',
++                provider_name: 'closerouter',
++                added: 0,
++                removed: 0,
++                detail: 'limits and efforts of 1 model updated from CloseRouter',
++              },
++            ],
++            unchanged: [],
++            failed: [],
++          };
++        }),
++        ...overrides,
++      });
++    }
++
++    function backgroundRefresh(driver: StartupDriver): Promise<void> {
++      return (driver as unknown as { backgroundRefreshPromise: Promise<void> }).backgroundRefreshPromise;
++    }
++
++    it('starts the lazy footer at the effective limit and an effort an always-thinking model runs at', async () => {
++      const harness = makeHarness(makeSession(), {
++        getConfig: vi.fn(async () => ({
++          models: {
++            astra: {
++              model: 'openai/gpt-6-astra',
++              maxContextSize: 786_432,
++              capabilities: ['thinking', 'always_thinking'],
++              supportEfforts: ['low', 'high', 'max'],
++              defaultEffort: 'high',
++              overrides: { maxContextSize: 400_000 },
++            },
++          },
++          defaultModel: 'astra',
++          thinking: { enabled: false },
++        })),
++      });
++      const driver = makeDriver(harness, makeStartupInput());
++
++      await expect(driver.init()).resolves.toBe(false);
++
++      expect(harness.createSession).not.toHaveBeenCalled();
++      expect(driver.state.appState).toMatchObject({ model: 'astra', maxContextTokens: 400_000, thinkingEffort: 'high' });
++    });
++
++    it('moves the lazy footer to the refreshed limit and an effort the model can run at', async () => {
++      const harness = closeRouterHarness();
++      const driver = makeDriver(harness, makeStartupInput());
++
++      await expect(driver.init()).resolves.toBe(false);
++      await backgroundRefresh(driver);
++
++      expect(driver.state.appState).toMatchObject({
++        model: 'astra',
++        maxContextTokens: 786_432,
++        thinkingEffort: 'high',
++      });
++      expect(JSON.stringify(driver.state.transcriptContainer.children)).toContain(
++        'closerouter · limits and efforts of 1 model updated from CloseRouter.',
++      );
++    });
++
++    it('re-reads the live session status after a refresh changed its model', async () => {
++      const session = makeSession({ id: 'ses-latest' });
++      // The refresh answers only after the session is live, like the engine's network refresh.
++      let finishRefresh!: () => void;
++      const refreshed = new Promise<void>((resolve) => {
++        finishRefresh = resolve;
++      });
++      const harness = closeRouterHarness(
++        session,
++        { listSessions: vi.fn(async () => [{ id: 'ses-latest' }]) },
++        refreshed,
++      );
++      const driver = makeDriver(harness, makeStartupInput({ continue: true }));
++
++      await expect(driver.init()).resolves.toBe(true);
++      session.getStatus.mockResolvedValue({
++        model: 'astra',
++        thinkingEffort: 'high',
++        permission: 'manual',
++        planMode: false,
++        contextTokens: 10,
++        maxContextTokens: 786_432,
++        contextUsage: 10 / 786_432,
++      });
++      finishRefresh();
++      await backgroundRefresh(driver);
++
++      expect(driver.state.appState).toMatchObject({ maxContextTokens: 786_432, thinkingEffort: 'high' });
++      expect(driver.state.appState.contextUsage).toBeCloseTo(driver.state.appState.contextTokens / 786_432);
++    });
++  });
++
+   it('syncs a persisted goal when resuming a session', async () => {
+     const goal = goalSnapshot({ status: 'blocked', terminalReason: 'needs input' });
+     const session = makeSession({
+diff --git a/apps/kimi-code/test/tui/utils/thinking-config.test.ts b/apps/kimi-code/test/tui/utils/thinking-config.test.ts
+index fd41b76681e3dcbedc69accd5eb3e385051817c2..c88441fa172c803e19cab3641e480b6772a6d005 100644
+--- a/apps/kimi-code/test/tui/utils/thinking-config.test.ts
++++ b/apps/kimi-code/test/tui/utils/thinking-config.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from 'vitest';
+ 
+ import {
++  configuredModelDefaults,
+   isThinkingOn,
+   thinkingEffortFromConfig,
+   thinkingEffortToConfig,
+@@ -128,3 +129,52 @@ describe('thinkingEffortFromConfig', () => {
+     expect(thinkingEffortFromConfig(config)).toBe(expected);
+   });
+ });
++
++describe('configuredModelDefaults', () => {
++  const providers = { router: { type: 'openai' as const, baseUrl: 'https://api.closerouter.dev/v1' } };
++  const models = {
++    astra: {
++      provider: 'router',
++      model: 'openai/gpt-6-astra',
++      maxContextSize: 786_432,
++      capabilities: ['thinking', 'always_thinking'],
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
++      defaultEffort: 'high',
++    },
++    sol: {
++      provider: 'router',
++      model: 'openai/gpt-5.6-sol',
++      maxContextSize: 786_432,
++      maxInputSize: 700_000,
++      capabilities: ['thinking'],
++      supportEfforts: ['low', 'high', 'ultra'],
++      offEffort: 'none',
++      overrides: { maxContextSize: 500_000 },
++    },
++  };
++
++  it('never shows a model that cannot stop reasoning as off', () => {
++    expect(
++      configuredModelDefaults({ providers, models, thinking: { enabled: false, effort: 'medium' } }, 'astra'),
++    ).toEqual({ maxContextTokens: 786_432, thinkingEffort: 'medium' });
++    expect(configuredModelDefaults({ providers, models, thinking: { enabled: false } }, 'astra')).toMatchObject({
++      thinkingEffort: 'high',
++    });
++  });
++
++  it('keeps thinking off for a model that can stop reasoning and uses its effective input limit', () => {
++    expect(configuredModelDefaults({ providers, models, thinking: { enabled: false } }, 'sol')).toEqual({
++      maxContextTokens: 500_000,
++      thinkingEffort: 'off',
++    });
++    expect(configuredModelDefaults({ providers, models, thinking: { enabled: true } }, 'sol')).toMatchObject({
++      thinkingEffort: 'high',
++    });
++  });
++
++  it('falls back to the configured thinking for an unknown alias', () => {
++    expect(configuredModelDefaults({ providers, models, thinking: { enabled: true, effort: 'low' } }, 'gone')).toEqual({
++      thinkingEffort: 'low',
++    });
++  });
++});
+diff --git a/packages/agent-core-v2/src/app/kosongConfig/discovery.ts b/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
+index f93679062b91477e4f4545c4dbc0b5f7228e8aee..72bd57816a1756f53d93060febecd93d40bf6ab7 100644
+--- a/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
++++ b/packages/agent-core-v2/src/app/kosongConfig/discovery.ts
+@@ -10,6 +10,7 @@ export const providerRefreshChangeSchema = z.object({
+   provider_name: z.string().min(1),
+   added: z.number().int().min(0),
+   removed: z.number().int().min(0),
++  detail: z.string().min(1).optional(),
+ });
+ export type ProviderRefreshChange = z.infer<typeof providerRefreshChangeSchema>;
+ 
+diff --git a/packages/agent-core-v2/src/app/kosongConfig/discoveryService.ts b/packages/agent-core-v2/src/app/kosongConfig/discoveryService.ts
+index fffa8077072b8c1362996d09787192705684b934..462c36c9670c2ed59f8a1eb9e7cff5f445ac2462 100644
+--- a/packages/agent-core-v2/src/app/kosongConfig/discoveryService.ts
++++ b/packages/agent-core-v2/src/app/kosongConfig/discoveryService.ts
+@@ -25,6 +25,10 @@ import {
+   type ProviderConfig,
+ } from '#/llm-adapter/provider/provider';
+ import { getProviderDefinition } from '#/llm-adapter/provider/provider-definition';
++import {
++  SECONDARY_MODEL_SECTION,
++  type SecondaryModelConfig,
++} from '#/session/subagent/configSection';
+ 
+ import {
+   DEFAULT_MODEL_SECTION,
+@@ -195,6 +199,7 @@ export class ProviderDiscoveryService extends Disposable implements IProviderDis
+         : visibleModels) as ManagedKimiConfigShape['models'],
+       defaultModel,
+       thinking: thinking === undefined ? undefined : { ...thinking },
++      secondaryModel: this.config.inspect<SecondaryModelConfig>(SECONDARY_MODEL_SECTION).userValue,
+     };
+   }
+ 
+@@ -305,6 +310,7 @@ function mapRefreshResult(result: RefreshResult): RefreshProviderModelsResponse
+       provider_name: change.providerName,
+       added: change.added,
+       removed: change.removed,
++      detail: change.detail,
+     })),
+     unchanged: [...result.unchanged],
+     failed: result.failed.map((failure) => ({
+diff --git a/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts b/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e130f44ad296e883a6bc7c807ebe04af5cafb119
+--- /dev/null
++++ b/packages/agent-core-v2/test/llm-adapter/model/closerouterRequests.test.ts
+@@ -0,0 +1,320 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import { refreshProviderModels, type ManagedKimiConfigShape } from '@moonshot-ai/kimi-code-oauth';
++
++import { createScopedTestHost } from '#/_base/di/test';
++import { IConfigService } from '#/app/config/config';
++import { HostRequestHeadersAdapter } from '#/app/kosongConfig/hostRequestHeadersAdapter';
++import type { Message } from '#/llm-adapter/contract/message';
++import { IModelCatalog } from '#/llm-adapter/model/catalog';
++import '#/llm-adapter/model/catalog-service';
++import '#/llm-adapter/model/catalog-runtime';
++import { completionBudgetParams, resolveCompletionBudget } from '#/llm-adapter/model/completion-budget';
++import '#/llm-adapter/model/errors';
++import { IHostRequestHeaders } from '#/llm-adapter/model/host-request-headers';
++import { IModelService, type ModelsSection } from '#/llm-adapter/model/model';
++import { IModelOAuthTokens } from '#/llm-adapter/model/model-oauth';
++import '#/llm-adapter/model/model-service';
++import {
++  resolveThinkingEffortForModel,
++  type ThinkingConfig,
++} from '#/llm-adapter/model/thinking';
++import '#/llm-adapter/protocol/protocolAdapterRegistry';
++import { IProviderService, type ProvidersSection } from '#/llm-adapter/provider/provider';
++import '#/llm-adapter/provider/provider-service';
++import { assertValidSubagentModelConfig } from '#/session/subagent/configSection';
++
++import { StubConfigService, stubModelOAuthTokens } from '../../stubs';
++import { stubAgentIdentity } from '../../app/agentIdentity/stubs';
++import { stubBootstrap } from '../../app/bootstrap/stubs';
++
++const KEY_ENV = 'CLOSEROUTER_E2E_KEY';
++const API = 'https://api.closerouter.dev/v1';
++
++const ENDPOINTS: Record<string, unknown[]> = {
++  'openai/gpt-6-astra': [
++    { type: 'chat', supports_streaming: true, supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
++    { type: 'responses', supports_streaming: true, supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
++  ],
++  'openai/gpt-5.6-sol': [
++    {
++      type: 'chat',
++      supports_streaming: true,
++      supported_reasoning_efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++    },
++  ],
++  'anthropic/claude-opus-4.8': [
++    {
++      type: 'messages',
++      supports_streaming: true,
++      supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++    },
++  ],
++};
++
++const CATALOG = [
++  { id: 'openai/gpt-6-astra', context_length: 786432, max_output_tokens: 128000 },
++  { id: 'openai/gpt-5.6-sol', context_length: 786432, max_output_tokens: 128000 },
++  { id: 'anthropic/claude-opus-4.8', context_length: 200000, max_output_tokens: 32000 },
++];
++
++const CHAT_SSE = [
++  'data: {"id":"c1","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4,"cost":0.001}}',
++  '',
++  'data: [DONE]',
++  '',
++  '',
++].join('\n');
++
++const RESPONSES_SSE = [
++  'event: response.output_text.delta',
++  'data: {"type":"response.output_text.delta","delta":"ok"}',
++  '',
++  'event: response.completed',
++  'data: {"type":"response.completed","response":{"id":"r1","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}',
++  '',
++  '',
++].join('\n');
++
++const MESSAGES_SSE = [
++  'event: message_start',
++  'data: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","content":[],"model":"m","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":1}}}',
++  '',
++  'event: content_block_start',
++  'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
++  '',
++  'event: content_block_delta',
++  'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
++  '',
++  'event: content_block_stop',
++  'data: {"type":"content_block_stop","index":0}',
++  '',
++  'event: message_delta',
++  'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}',
++  '',
++  'event: message_stop',
++  'data: {"type":"message_stop"}',
++  '',
++  '',
++].join('\n');
++
++interface CapturedRequest {
++  readonly url: string;
++  readonly authorization: string | null;
++  readonly body: Record<string, unknown>;
++}
++
++function stubCloseRouter(): CapturedRequest[] {
++  const captured: CapturedRequest[] = [];
++  vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
++    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++    if (init?.method === undefined || init.method === 'GET') {
++      if (url === `${API}/models`) return Response.json({ data: CATALOG });
++      const id = /\/models\/(.+)\/endpoints$/.exec(url)?.[1];
++      const endpoints = id === undefined ? undefined : ENDPOINTS[decodeURIComponent(id)];
++      return endpoints === undefined
++        ? Response.json({}, { status: 404 })
++        : Response.json({ data: { endpoints } });
++    }
++    captured.push({
++      url,
++      authorization: new Headers(init.headers).get('authorization') ?? new Headers(init.headers).get('x-api-key'),
++      body: JSON.parse(init.body as string) as Record<string, unknown>,
++    });
++    const sse = url.endsWith('/chat/completions')
++      ? CHAT_SSE
++      : url.endsWith('/responses')
++        ? RESPONSES_SSE
++        : MESSAGES_SSE;
++    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
++  });
++  return captured;
++}
++
++function configuredSections(): ManagedKimiConfigShape {
++  return {
++    providers: {
++      closerouter: { type: 'openai', baseUrl: API, apiKeyEnv: KEY_ENV },
++      'closerouter-anthropic': { type: 'anthropic', baseUrl: 'https://api.closerouter.dev', apiKeyEnv: KEY_ENV },
++    },
++    models: {
++      astra: {
++        provider: 'closerouter',
++        model: 'openai/gpt-6-astra',
++        maxContextSize: 1000000,
++        maxOutputSize: 32000,
++        overrides: { maxOutputSize: 32000 },
++      },
++      'astra-responses': {
++        provider: 'closerouter',
++        model: 'openai/gpt-6-astra',
++        maxContextSize: 1000000,
++        protocol: 'openai_responses',
++      },
++      sol: { provider: 'closerouter', model: 'openai/gpt-5.6-sol', maxContextSize: 1000000 },
++      opus: { provider: 'closerouter-anthropic', model: 'anthropic/claude-opus-4.8', maxContextSize: 200000 },
++    },
++  };
++}
++
++async function refreshed(
++  sections: ManagedKimiConfigShape = configuredSections(),
++  expectedFailures = 0,
++): Promise<ManagedKimiConfigShape> {
++  let config = sections;
++  const result = await refreshProviderModels({
++    getConfig: async () => structuredClone(config),
++    setConfig: async (patch) => (config = { ...config, ...structuredClone(patch) }),
++    removeProvider: async () => config,
++    resolveOAuthToken: async () => '',
++  });
++  expect(result.failed).toHaveLength(expectedFailures);
++  return config;
++}
++
++const configs = new WeakMap<IModelCatalog, IConfigService>();
++
++function catalogFor(sections: ManagedKimiConfigShape): IModelCatalog {
++  const host = createScopedTestHost([
++    [IConfigService, new StubConfigService(sections)],
++    [IModelOAuthTokens, stubModelOAuthTokens()],
++    [
++      IHostRequestHeaders,
++      new HostRequestHeadersAdapter(
++        stubBootstrap('/home', {}, { requestHeaders: {} }),
++        stubAgentIdentity({ hostRequestHeaders: {} }),
++      ),
++    ],
++  ]);
++  host.app.accessor.get(IProviderService).loadAll(sections.providers as ProvidersSection, undefined);
++  configs.set(host.app.accessor.get(IModelCatalog), host.app.accessor.get(IConfigService));
++  host.app.accessor.get(IModelService).loadAll(sections.models as ModelsSection, undefined);
++  return host.app.accessor.get(IModelCatalog);
++}
++
++const MESSAGES: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [] }];
++
++async function send(
++  catalog: IModelCatalog,
++  alias: string,
++  thinking: ThinkingConfig,
++  requested?: string,
++): Promise<void> {
++  const model = catalog.get(alias);
++  const thinkingEffort = resolveThinkingEffortForModel(requested, thinking, model);
++  const budget = completionBudgetParams({
++    budget: resolveCompletionBudget({ maxOutputSize: model.maxOutputSize }),
++    capability: model.capabilities,
++  });
++  for await (const event of catalog.generate(
++    alias,
++    { systemPrompt: 'test', tools: [], messages: MESSAGES },
++    undefined,
++    { thinkingEffort, ...budget },
++  )) {
++    void event;
++  }
++}
++
++beforeEach(() => {
++  vi.stubEnv(KEY_ENV, 'test-key');
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.unstubAllEnvs();
++});
++
++describe('CloseRouter metadata from refresh to the serialized request', () => {
++  it('omits the effort for an unrefreshed alias but sends an explicit default once the endpoint declares efforts', async () => {
++    const captured = stubCloseRouter();
++    const thinkingOff: ThinkingConfig = { enabled: false, effort: 'high' };
++
++    await send(catalogFor(configuredSections()), 'astra', thinkingOff);
++    const sections = await refreshed();
++    const catalog = catalogFor(sections);
++    await send(catalog, 'astra', thinkingOff);
++
++    expect(captured[0]!.body).not.toHaveProperty('reasoning_effort');
++    expect(captured[1]!.url).toBe(`${API}/chat/completions`);
++    expect(captured[1]!.authorization).toBe('Bearer test-key');
++    expect(captured[1]!.body).toMatchObject({ model: 'openai/gpt-6-astra', reasoning_effort: 'high', max_tokens: 32000 });
++    expect(catalog.get('astra')).toMatchObject({
++      alwaysThinking: true,
++      maxOutputSize: 32000,
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
++    });
++    expect(catalog.get('astra').capabilities.max_context_tokens).toBe(786432);
++  });
++
++  it('encodes the endpoint-specific effort fields and limits for Chat, Responses and Messages', async () => {
++    const captured = stubCloseRouter();
++    const catalog = catalogFor(await refreshed());
++    const thinkingOn: ThinkingConfig = { enabled: true, effort: 'high' };
++
++    await send(catalog, 'sol', thinkingOn, 'ultra');
++    await send(catalog, 'astra-responses', thinkingOn, 'xhigh');
++    await send(catalog, 'opus', thinkingOn);
++    await send(catalog, 'opus', thinkingOn, 'ultra');
++
++    expect(captured.map((request) => request.url)).toEqual([
++      `${API}/chat/completions`,
++      `${API}/responses`,
++      `${API}/messages`,
++      `${API}/messages`,
++    ]);
++    expect(captured[0]!.body).toMatchObject({ reasoning_effort: 'ultra', max_tokens: 128000 });
++    expect(captured[1]!.body).toMatchObject({ reasoning: { effort: 'xhigh' }, max_output_tokens: 128000 });
++    expect(captured[1]!.body).not.toHaveProperty('reasoning_effort');
++    expect(captured[2]!.body).toMatchObject({
++      thinking: { type: 'adaptive' },
++      output_config: { effort: 'high' },
++      max_tokens: 32000,
++    });
++    expect(captured[3]!.body).toMatchObject({ output_config: { effort: 'ultra' } });
++    expect(catalog.get('opus').capabilities.max_context_tokens).toBe(200000);
++  });
++
++  it('turns thinking off only through the mechanism each endpoint declares', async () => {
++    const captured = stubCloseRouter();
++    const catalog = catalogFor(await refreshed());
++    const thinkingOff: ThinkingConfig = { enabled: false };
++
++    await send(catalog, 'sol', thinkingOff);
++    await send(catalog, 'opus', thinkingOff);
++    await send(catalog, 'astra', thinkingOff, 'off');
++
++    expect(captured[0]!.body).toMatchObject({ reasoning_effort: 'none' });
++    expect(captured[1]!.body).toMatchObject({ thinking: { type: 'disabled' } });
++    expect(captured[1]!.body).not.toHaveProperty('output_config');
++    expect(captured[2]!.body).toMatchObject({ reasoning_effort: 'high' });
++  });
++
++  it('keeps sessions startable with a subagent pool whose default effort the new efforts would reject', async () => {
++    stubCloseRouter();
++    const withPool = (defaultEffort: string): ManagedKimiConfigShape => ({
++      ...configuredSections(),
++      secondaryModel: { defaultModel: 'astra', defaultEffort },
++    });
++
++    const off = await refreshed(withPool('off'), 1);
++    const offCatalog = catalogFor(off);
++    expect(() => {
++      assertValidSubagentModelConfig(configs.get(offCatalog)!, offCatalog);
++    }).not.toThrow();
++    expect(offCatalog.get('astra').alwaysThinking).toBe(false);
++    expect(offCatalog.get('astra').capabilities.max_context_tokens).toBe(786432);
++
++    const high = await refreshed(withPool('high'));
++    const highCatalog = catalogFor(high);
++    expect(() => {
++      assertValidSubagentModelConfig(configs.get(highCatalog)!, highCatalog);
++    }).not.toThrow();
++    expect(highCatalog.get('astra').alwaysThinking).toBe(true);
++
++    const forced = catalogFor({ ...high, secondaryModel: { defaultModel: 'astra', defaultEffort: 'off' } });
++    expect(() => {
++      assertValidSubagentModelConfig(configs.get(forced)!, forced);
++    }).toThrow(/always reasons/);
++  });
++});
+diff --git a/packages/klient/src/contract/global/events.ts b/packages/klient/src/contract/global/events.ts
+index d655814559a9d2c869a029a9546e00172b32026e..73c7084d6d47379d25e5bb621a39a757c0d18674 100644
+--- a/packages/klient/src/contract/global/events.ts
++++ b/packages/klient/src/contract/global/events.ts
+@@ -84,6 +84,7 @@ export const catalogChangedSchema = z.object({
+       provider_name: z.string(),
+       added: z.number(),
+       removed: z.number(),
++      detail: z.string().optional(),
+     }),
+   ),
+   unchanged: z.array(z.string()),
+diff --git a/packages/klient/src/contract/global/providerDiscovery.ts b/packages/klient/src/contract/global/providerDiscovery.ts
+index c02751239f1086511d2e0fa0a0cff5c2b97300a1..c3e8396f6e971eedbe67b0e9f79563c325713133 100644
+--- a/packages/klient/src/contract/global/providerDiscovery.ts
++++ b/packages/klient/src/contract/global/providerDiscovery.ts
+@@ -22,6 +22,7 @@ export const refreshProviderModelsResponseSchema = z.object({
+       provider_name: z.string(),
+       added: z.number(),
+       removed: z.number(),
++      detail: z.string().optional(),
+     }),
+   ),
+   unchanged: z.array(z.string()),
+diff --git a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
+index 97590a68bbbf2d70cb75fb8703ced01c345dc109..11e7cd0b56d921341e65d3f3a95bfe75ea20ad21 100644
+--- a/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
++++ b/packages/node-sdk/test/sdk-rpc-client-v2.test.ts
+@@ -1338,6 +1338,54 @@ key = "${titleOAuthRef.key}"
+     }
+   });
+ 
++  it('reports a CloseRouter metadata refresh through the harness with its detail', async () => {
++    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
++      const url = input instanceof Request ? input.url : String(input);
++      return Response.json(
++        url.endsWith('/endpoints')
++          ? {
++              data: {
++                endpoints: [
++                  { type: 'chat', supports_streaming: true, supported_reasoning_efforts: ['low', 'high', 'max'] },
++                ],
++              },
++            }
++          : { data: [{ id: 'openai/gpt-6-astra', context_length: 786_432, max_output_tokens: 128_000 }] },
++      );
++    });
++    const { harness } = await makeHarness();
++    try {
++      await harness.setConfig({
++        providers: {
++          closerouter: { type: 'openai', baseUrl: 'https://api.closerouter.dev/v1', apiKey: 'sk-closerouter' },
++        },
++        models: {
++          'closerouter/astra': { provider: 'closerouter', model: 'openai/gpt-6-astra', maxContextSize: 1_000_000 },
++        },
++      });
++
++      const result = await harness.refreshProviderModels();
++
++      expect(result.changed).toEqual([
++        {
++          provider_id: 'closerouter',
++          provider_name: 'closerouter',
++          added: 0,
++          removed: 0,
++          detail: 'limits and efforts of 1 model updated from CloseRouter',
++        },
++      ]);
++      const config = await harness.getConfig({ reload: true });
++      expect(config.models?.['closerouter/astra']).toMatchObject({
++        maxContextSize: 786_432,
++        supportEfforts: ['low', 'high', 'max'],
++      });
++    } finally {
++      vi.unstubAllGlobals();
++      await harness.close();
++    }
++  });
++
+   it('round-trips the secondaryModel pool field to the [secondary_model] config section', async () => {
+     const { harness, homeDir } = await makeHarness();
+     try {
+diff --git a/packages/oauth/src/closerouter.ts b/packages/oauth/src/closerouter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b3b21e76195002e4091584b887f7c5f435bfee5
+--- /dev/null
++++ b/packages/oauth/src/closerouter.ts
+@@ -0,0 +1,761 @@
++import type { ManagedKimiConfigShape } from './managed-kimi-code';
++import { readApiErrorMessage } from './api-error';
++import {
++  apiKeyEnvMissingMessage,
++  declaredProviderCredential,
++  nonEmptyString,
++} from './provider-credential';
++import { isRecord } from './utils';
++
++/**
++ * CloseRouter model metadata refresh.
++ *
++ * Configured aliases whose endpoint is CloseRouter get their limits from
++ * `GET /v1/models` (`context_length`, `max_output_tokens`) and the reasoning
++ * efforts of the endpoint they are actually called through from
++ * `GET /v1/models/{author}/{model}/endpoints`. Only aliases that already exist
++ * are updated; the catalog is never imported.
++ *
++ * Refreshed (top-level) fields: `maxContextSize`, `maxOutputSize`,
++ * `supportEfforts`, `defaultEffort`, `offEffort` (Chat / Responses only) and
++ * the `thinking` / `always_thinking` capability tags. Values under
++ * `[models."<alias>".overrides]` win at runtime and are never touched, so that
++ * is where a deliberate cap or effort list belongs.
++ *
++ * A key missing from a written alias survives the config write (refresh
++ * writes cannot delete a key), so this module only writes definite values.
++ * The one key it can therefore leave stale is `offEffort` when an endpoint
++ * stops listing `none`: the alias becomes `always_thinking`, which never sends
++ * "off", so the stale value is never used.
++ */
++
++const CLOSEROUTER_HOST = 'api.closerouter.dev';
++const CLOSEROUTER_API_BASE = `https://${CLOSEROUTER_HOST}/v1`;
++
++const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
++const DEFAULT_DEADLINE_MS = 30_000;
++const DEFAULT_CONCURRENCY = 4;
++
++export type CloseRouterEndpointType = 'chat' | 'responses' | 'messages';
++
++const ENDPOINT_TYPE_BY_PROTOCOL: Readonly<Record<string, CloseRouterEndpointType>> = {
++  openai: 'chat',
++  openai_responses: 'responses',
++  anthropic: 'messages',
++};
++
++const ENDPOINT_LABEL: Readonly<Record<CloseRouterEndpointType, string>> = {
++  chat: 'Chat Completions',
++  responses: 'Responses',
++  messages: 'Messages',
++};
++
++/** Keys of a provider's `env` table that the runtime reads for each provider type. */
++const ENV_TABLE_API_KEY: Readonly<Record<string, string>> = {
++  openai: 'OPENAI_API_KEY',
++  openai_responses: 'OPENAI_API_KEY',
++  anthropic: 'ANTHROPIC_API_KEY',
++};
++const ENV_TABLE_BASE_URL: Readonly<Record<string, string>> = {
++  openai: 'OPENAI_BASE_URL',
++  openai_responses: 'OPENAI_BASE_URL',
++  anthropic: 'ANTHROPIC_BASE_URL',
++};
++
++/** Thinking capability tags a refresh owns; every other capability is left alone. */
++const OWNED_CAPABILITIES: ReadonlySet<string> = new Set(['thinking', 'always_thinking']);
++
++const EFFORT_RANK = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
++const EFFORT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
++const SERVICE_TIER_SUFFIX = /:(?:flex|default|priority)$/;
++/** Entries the engine synthesizes from `KIMI_MODEL_*` variables; they never persist. */
++const ENV_OVERLAY_PREFIX = '__kimi_env';
++
++export interface CloseRouterRefreshHost {
++  getConfig(): Promise<ManagedKimiConfigShape>;
++  setConfig(patch: ManagedKimiConfigShape): Promise<ManagedKimiConfigShape>;
++  readonly userAgent?: string;
++}
++
++export interface CloseRouterRefreshOptions {
++  /** Refresh only the aliases of this provider. */
++  readonly providerId?: string;
++  readonly requestTimeoutMs?: number;
++  /** Upper bound for all CloseRouter requests of one refresh. */
++  readonly deadlineMs?: number;
++  /** Endpoint-detail requests in flight at once. */
++  readonly concurrency?: number;
++}
++
++export interface CloseRouterProviderChange {
++  readonly providerId: string;
++  readonly aliases: number;
++  readonly limits: boolean;
++  readonly efforts: boolean;
++}
++
++export interface CloseRouterRefreshResult {
++  /** The config after the write, or the latest config read when nothing was written. */
++  readonly config: ManagedKimiConfigShape;
++  /** Providers whose aliases changed: how many, and whether limits and/or efforts changed. */
++  readonly changed: ReadonlyArray<CloseRouterProviderChange>;
++  readonly unchanged: readonly string[];
++  readonly failed: ReadonlyArray<{ readonly provider: string; readonly reason: string }>;
++}
++
++interface CloseRouterTarget {
++  readonly alias: string;
++  readonly providerId: string;
++  readonly modelId: string;
++  readonly endpointType: CloseRouterEndpointType;
++}
++
++interface ModelLimits {
++  readonly maxContextSize?: number;
++  readonly maxOutputSize?: number;
++}
++
++type EndpointList = { readonly ok: true; readonly endpoints: readonly Record<string, unknown>[] } | {
++  readonly ok: false;
++  readonly reason: string;
++};
++
++interface GroupMetadata {
++  /** Catalog ids this refresh asked for; aliases added meanwhile wait for the next refresh. */
++  readonly requested: ReadonlySet<string>;
++  readonly limits: ReadonlyMap<string, ModelLimits>;
++  readonly endpoints: ReadonlyMap<string, EndpointList>;
++}
++
++interface AliasMetadata extends ModelLimits {
++  readonly efforts?: readonly string[];
++}
++
++class FailureLog {
++  private readonly entries: Array<{ provider: string; reason: string }> = [];
++  private readonly seen = new Set<string>();
++
++  add(provider: string, reason: string): void {
++    const key = JSON.stringify([provider, reason]);
++    if (this.seen.has(key)) return;
++    this.seen.add(key);
++    this.entries.push({ provider, reason });
++  }
++
++  addFor(targets: readonly CloseRouterTarget[], reason: string): void {
++    for (const target of targets) this.add(target.providerId, reason);
++  }
++
++  list(): ReadonlyArray<{ provider: string; reason: string }> {
++    return this.entries;
++  }
++}
++
++/**
++ * Normalizes a configured base URL to CloseRouter's API base, or returns
++ * undefined when it is not CloseRouter. Both the OpenAI-style form
++ * (`https://api.closerouter.dev/v1`) and the Anthropic-style form
++ * (`https://api.closerouter.dev`) are accepted; anything else (plain HTTP, a
++ * port, credentials, a query, another path or host) is rejected so the API
++ * key is only ever sent to CloseRouter itself.
++ */
++export function closeRouterApiBase(baseUrl: unknown): string | undefined {
++  const value = nonEmptyString(baseUrl);
++  if (value === undefined) return undefined;
++  let url: URL;
++  try {
++    url = new URL(value);
++  } catch {
++    return undefined;
++  }
++  if (url.protocol !== 'https:' || url.hostname !== CLOSEROUTER_HOST) return undefined;
++  if (url.port !== '' || url.username !== '' || url.password !== '') return undefined;
++  if (url.search !== '' || url.hash !== '') return undefined;
++  return /^\/(?:v1\/?)?$/.test(url.pathname) ? CLOSEROUTER_API_BASE : undefined;
++}
++
++export async function refreshCloseRouterModels(
++  host: CloseRouterRefreshHost,
++  config: ManagedKimiConfigShape,
++  options: CloseRouterRefreshOptions = {},
++): Promise<CloseRouterRefreshResult> {
++  const targets = closeRouterTargets(config, options.providerId);
++  if (targets.length === 0) return { config, changed: [], unchanged: [], failed: [] };
++
++  const failures = new FailureLog();
++  const groups = groupByApiKey(config, targets, failures);
++  const fetched = await fetchGroups(groups, host.userAgent, options, failures);
++  if (fetched.size === 0) return { config, changed: [], unchanged: [], failed: failures.list() };
++
++  // Merge into the config as it is now, not as it was before the requests:
++  // aliases edited, added or removed meanwhile are taken as they are, and an
++  // alias whose model, endpoint or key changed is left for the next refresh.
++  let fresh: ManagedKimiConfigShape;
++  try {
++    fresh = await host.getConfig();
++  } catch (error) {
++    failures.addFor(targets, `Could not re-read the config after the CloseRouter requests: ${errorMessage(error)}`);
++    return { config, changed: [], unchanged: [], failed: failures.list() };
++  }
++  const next = structuredClone(fresh);
++  const subagentEffort = secondaryModelEffort(fresh);
++  const changed = new Map<string, CloseRouterProviderChange>();
++  const seen = new Set<string>();
++  for (const target of closeRouterTargets(fresh, options.providerId)) {
++    seen.add(target.providerId);
++    const apiKey = resolveApiKey(fresh, target);
++    const metadata = apiKey.ok ? fetched.get(apiKey.value) : undefined;
++    if (metadata === undefined || !metadata.requested.has(catalogId(target.modelId))) continue;
++    const current = readAlias(fresh, target.alias);
++    const aliasMetadata = metadataForTarget(metadata, target, current, failures);
++    let patched = patchAlias(current, target.endpointType, aliasMetadata);
++    const conflict = subagentEffortConflict(subagentEffort, target.alias, current, patched);
++    if (conflict !== undefined) {
++      failures.add(target.providerId, conflict);
++      patched = patchAlias(current, target.endpointType, { ...aliasMetadata, efforts: undefined });
++    }
++    if (!sameAlias(current, patched)) {
++      next.models![target.alias] = patched;
++      const previous = changed.get(target.providerId);
++      changed.set(target.providerId, {
++        providerId: target.providerId,
++        aliases: (previous?.aliases ?? 0) + 1,
++        limits:
++          previous?.limits === true ||
++          current['maxContextSize'] !== patched['maxContextSize'] ||
++          current['maxOutputSize'] !== patched['maxOutputSize'],
++        efforts:
++          previous?.efforts === true ||
++          JSON.stringify(thinkingFields(current)) !== JSON.stringify(thinkingFields(patched)),
++      });
++    }
++  }
++
++  const failed = failures.list();
++  const unchanged = [...seen].filter(
++    (providerId) =>
++      !changed.has(providerId) && !failed.some((failure) => failure.provider === providerId),
++  );
++  if (changed.size === 0) return { config: fresh, changed: [], unchanged, failed };
++  try {
++    // Only the models section is written; every host leaves sections absent
++    // from the patch untouched, so concurrent provider edits survive.
++    const written = await host.setConfig({ models: next.models } as ManagedKimiConfigShape);
++    return { config: written, changed: [...changed.values()], unchanged, failed };
++  } catch (error) {
++    for (const providerId of changed.keys()) {
++      failures.add(providerId, `Could not save the refreshed CloseRouter metadata: ${errorMessage(error)}`);
++    }
++    return { config: fresh, changed: [], unchanged, failed: failures.list() };
++  }
++}
++
++function closeRouterTargets(
++  config: ManagedKimiConfigShape,
++  providerId: string | undefined,
++): CloseRouterTarget[] {
++  const targets: CloseRouterTarget[] = [];
++  for (const [alias, model] of Object.entries(config.models ?? {})) {
++    if (!isRecord(model) || alias.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    const owner = nonEmptyString(model['provider']);
++    if (owner === undefined || owner.startsWith(ENV_OVERLAY_PREFIX)) continue;
++    if (providerId !== undefined && owner !== providerId) continue;
++    const provider = config.providers[owner];
++    if (!isRecord(provider)) continue;
++    // `model_source = "static"` opts a provider out of every refresh; registry-
++    // and OAuth-managed providers and models belong to their own refreshes.
++    if (provider['modelSource'] === 'static') continue;
++    if (provider['source'] !== undefined || provider['oauth'] !== undefined) continue;
++    if (model['oauth'] !== undefined) continue;
++    const protocol = model['protocol'] ?? provider['type'];
++    const endpointType =
++      typeof protocol === 'string' ? ENDPOINT_TYPE_BY_PROTOCOL[protocol] : undefined;
++    if (endpointType === undefined) continue;
++    // Same precedence as the runtime: a per-model `base_url` beats the provider's.
++    const baseUrl = nonEmptyString(model['baseUrl']) ?? nonEmptyString(provider['baseUrl']);
++    if (closeRouterApiBase(baseUrl) === undefined) continue;
++    const modelId = nonEmptyString(model['name']) ?? nonEmptyString(model['model']);
++    if (modelId === undefined) continue;
++    targets.push({ alias, providerId: owner, modelId, endpointType });
++  }
++  return targets;
++}
++
++function readAlias(config: ManagedKimiConfigShape, alias: string): Record<string, unknown> {
++  const model = config.models?.[alias];
++  return isRecord(model) ? model : {};
++}
++
++type ApiKeyResolution = { readonly ok: true; readonly value: string } | {
++  readonly ok: false;
++  readonly reason: string;
++};
++
++/**
++ * The key the runtime would send for this alias: a key on the model itself,
++ * else the provider's declared key, else its `env` table entry. A provider's
++ * key is used only when the provider itself points at CloseRouter. Without a
++ * base URL it talks to its vendor's default API, and with another one it
++ * belongs to that endpoint, so an alias that only re-routes such a provider to
++ * CloseRouter is not refreshed: a refresh never sends a vendor's key to
++ * CloseRouter, even for an alias the user never selects.
++ */
++function resolveApiKey(config: ManagedKimiConfigShape, target: CloseRouterTarget): ApiKeyResolution {
++  const model = readAlias(config, target.alias);
++  const modelKey = nonEmptyString(model['apiKey']);
++  if (modelKey !== undefined) return { ok: true, value: modelKey };
++  const provider = config.providers[target.providerId];
++  const view = isRecord(provider) ? provider : {};
++  const type = view['type'] ?? model['protocol'];
++  const env = view['env'];
++  const ownBaseUrl =
++    nonEmptyString(view['baseUrl']) ??
++    (isRecord(env) && typeof type === 'string' ? nonEmptyString(env[ENV_TABLE_BASE_URL[type] ?? '']) : undefined);
++  if (closeRouterApiBase(ownBaseUrl) === undefined) {
++    return {
++      ok: false,
++      reason: `${target.alias} re-routes provider "${target.providerId}" (whose own endpoint is elsewhere) to CloseRouter; give it a provider whose base_url is CloseRouter to refresh its limits and efforts.`,
++    };
++  }
++  const declared = declaredProviderCredential(view, target.providerId);
++  switch (declared.kind) {
++    case 'conflict':
++      return { ok: false, reason: declared.message };
++    case 'inline':
++      return { ok: true, value: declared.apiKey };
++    case 'env': {
++      const value = nonEmptyString(process.env[declared.apiKeyEnv]);
++      return value === undefined
++        ? { ok: false, reason: apiKeyEnvMissingMessage(target.providerId, declared.apiKeyEnv) }
++        : { ok: true, value };
++    }
++    case 'none': {
++      const name = typeof type === 'string' ? ENV_TABLE_API_KEY[type] : undefined;
++      const value = isRecord(env) && name !== undefined ? nonEmptyString(env[name]) : undefined;
++      return value === undefined
++        ? {
++            ok: false,
++            reason: `Provider "${target.providerId}" has no API key, so its CloseRouter model limits and efforts were not refreshed.`,
++          }
++        : { ok: true, value };
++    }
++  }
++}
++
++function groupByApiKey(
++  config: ManagedKimiConfigShape,
++  targets: readonly CloseRouterTarget[],
++  failures: FailureLog,
++): Map<string, CloseRouterTarget[]> {
++  const groups = new Map<string, CloseRouterTarget[]>();
++  for (const target of targets) {
++    const apiKey = resolveApiKey(config, target);
++    if (!apiKey.ok) {
++      failures.add(target.providerId, apiKey.reason);
++      continue;
++    }
++    const group = groups.get(apiKey.value);
++    if (group === undefined) groups.set(apiKey.value, [target]);
++    else group.push(target);
++  }
++  return groups;
++}
++
++interface MetadataClient {
++  readonly userAgent: string | undefined;
++  readonly deadline: AbortSignal;
++  readonly requestTimeoutMs: number;
++}
++
++async function fetchGroups(
++  groups: ReadonlyMap<string, readonly CloseRouterTarget[]>,
++  userAgent: string | undefined,
++  options: CloseRouterRefreshOptions,
++  failures: FailureLog,
++): Promise<Map<string, GroupMetadata>> {
++  const client: MetadataClient = {
++    userAgent,
++    deadline: AbortSignal.timeout(options.deadlineMs ?? DEFAULT_DEADLINE_MS),
++    requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
++  };
++  const out = new Map<string, GroupMetadata>();
++  for (const [apiKey, targets] of groups) {
++    const metadata = await fetchGroup(client, apiKey, targets, options.concurrency, failures);
++    if (metadata !== undefined) out.set(apiKey, metadata);
++  }
++  return out;
++}
++
++async function fetchGroup(
++  client: MetadataClient,
++  apiKey: string,
++  targets: readonly CloseRouterTarget[],
++  concurrency: number | undefined,
++  failures: FailureLog,
++): Promise<GroupMetadata | undefined> {
++  let catalog: unknown;
++  try {
++    catalog = await getJson(client, apiKey, '/models');
++  } catch (error) {
++    failures.addFor(
++      targets,
++      `CloseRouter model catalog request failed (${errorMessage(error)}); keeping the previous limits and efforts.`,
++    );
++    return undefined;
++  }
++  const entries = isRecord(catalog) && Array.isArray(catalog['data']) ? catalog['data'] : undefined;
++  if (entries === undefined) {
++    failures.addFor(
++      targets,
++      'CloseRouter returned a model catalog without a data list; keeping the previous limits and efforts.',
++    );
++    return undefined;
++  }
++
++  const requested = new Set(targets.map((target) => catalogId(target.modelId)));
++  const limits = new Map<string, ModelLimits>();
++  for (const entry of entries) {
++    if (!isRecord(entry) || typeof entry['id'] !== 'string' || !requested.has(entry['id'])) continue;
++    limits.set(entry['id'], {
++      maxContextSize: positiveInteger(entry['context_length']),
++      maxOutputSize: positiveInteger(entry['max_output_tokens']),
++    });
++  }
++
++  const ids = [...requested].filter((id) => limits.has(id));
++  const lists = await mapWithConcurrency(ids, concurrency ?? DEFAULT_CONCURRENCY, (id) =>
++    fetchEndpoints(client, apiKey, id),
++  );
++  const endpoints = new Map<string, EndpointList>();
++  ids.forEach((id, index) => endpoints.set(id, lists[index]!));
++  return { requested, limits, endpoints };
++}
++
++async function fetchEndpoints(
++  client: MetadataClient,
++  apiKey: string,
++  id: string,
++): Promise<EndpointList> {
++  if (!id.includes('/')) {
++    return { ok: false, reason: `"${id}" is not an author/model id` };
++  }
++  const path = `/models/${id.split('/').map(encodeURIComponent).join('/')}/endpoints`;
++  let detail: unknown;
++  try {
++    detail = await getJson(client, apiKey, path);
++  } catch (error) {
++    return { ok: false, reason: errorMessage(error) };
++  }
++  const data = isRecord(detail) ? detail['data'] : undefined;
++  const endpoints = isRecord(data) ? data['endpoints'] : undefined;
++  if (!Array.isArray(endpoints)) {
++    return { ok: false, reason: 'the response has no data.endpoints list' };
++  }
++  return { ok: true, endpoints: endpoints.filter(isRecord) };
++}
++
++function metadataForTarget(
++  metadata: GroupMetadata,
++  target: CloseRouterTarget,
++  current: Record<string, unknown>,
++  failures: FailureLog,
++): AliasMetadata {
++  const id = catalogId(target.modelId);
++  const limits = metadata.limits.get(id);
++  if (limits === undefined) {
++    failures.add(
++      target.providerId,
++      `${target.modelId} is not in the CloseRouter catalog for this API key; keeping its previous limits and efforts.`,
++    );
++    return {};
++  }
++  if (limits.maxContextSize === undefined) {
++    failures.add(
++      target.providerId,
++      `CloseRouter reports no valid context_length for ${target.modelId}; keeping its previous context size.`,
++    );
++  }
++  return { ...limits, efforts: effortsForTarget(metadata, target, current, failures) };
++}
++
++function effortsForTarget(
++  metadata: GroupMetadata,
++  target: CloseRouterTarget,
++  current: Record<string, unknown>,
++  failures: FailureLog,
++): readonly string[] | undefined {
++  const label = `${target.modelId} (${ENDPOINT_LABEL[target.endpointType]})`;
++  const list = metadata.endpoints.get(catalogId(target.modelId));
++  if (list === undefined) return undefined;
++  if (!list.ok) {
++    failures.add(
++      target.providerId,
++      `CloseRouter endpoint metadata for ${target.modelId} failed (${list.reason}); keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  const matches = list.endpoints.filter((endpoint) => endpoint['type'] === target.endpointType);
++  if (matches.length === 0) {
++    failures.add(
++      target.providerId,
++      `CloseRouter lists no ${ENDPOINT_LABEL[target.endpointType]} endpoint for ${target.modelId}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  if (matches.some((endpoint) => endpoint['supports_streaming'] === false)) {
++    failures.add(
++      target.providerId,
++      `CloseRouter reports that ${label} does not stream, which Kimi requires; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  const parsed = matches.map((endpoint) => parseEfforts(endpoint['supported_reasoning_efforts']));
++  const first = parsed[0];
++  if (first === undefined || parsed.some((efforts) => efforts === undefined)) {
++    failures.add(
++      target.providerId,
++      `CloseRouter returned invalid supported_reasoning_efforts for ${label}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  if (parsed.some((efforts) => !sameMembers(efforts!, first))) {
++    failures.add(
++      target.providerId,
++      `CloseRouter lists conflicting reasoning efforts for ${label}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  const levels = first.filter((effort) => effort !== 'none');
++  if (levels.length === 0 && Array.isArray(current['supportEfforts'])) {
++    failures.add(
++      target.providerId,
++      `CloseRouter lists no reasoning effort levels for ${label}; keeping its previous efforts.`,
++    );
++    return undefined;
++  }
++  return first;
++}
++
++/** Missing or null means the endpoint takes no effort; anything else must be a list of effort names. */
++function parseEfforts(value: unknown): readonly string[] | undefined {
++  if (value === undefined || value === null) return [];
++  if (!Array.isArray(value)) return undefined;
++  const efforts: string[] = [];
++  for (const item of value) {
++    if (typeof item !== 'string' || !EFFORT_PATTERN.test(item)) return undefined;
++    if (!efforts.includes(item)) efforts.push(item);
++  }
++  // Effort lists are ordered weakest to strongest everywhere else (default
++  // effort ranking, the picker); normalize when every value is a known level.
++  return efforts.every((effort) => EFFORT_RANK.includes(effort))
++    ? efforts.toSorted((a, b) => EFFORT_RANK.indexOf(a) - EFFORT_RANK.indexOf(b))
++    : efforts;
++}
++
++/**
++ * Applies refreshed metadata to one alias. Chat Completions and Responses can
++ * only stop reasoning through an explicit `none` effort, so without it the
++ * model is declared `always_thinking` and "off" is never offered or sent.
++ * Messages keeps native Anthropic thinking: "off" is sent as a disabled
++ * thinking block, and whether a model can turn reasoning off at all comes from
++ * its model profile at runtime, never from a missing `none` effort.
++ */
++function patchAlias(
++  current: Record<string, unknown>,
++  endpointType: CloseRouterEndpointType,
++  metadata: AliasMetadata,
++): Record<string, unknown> {
++  const next: Record<string, unknown> = { ...current };
++  if (metadata.maxContextSize !== undefined) next['maxContextSize'] = metadata.maxContextSize;
++  if (metadata.maxOutputSize !== undefined) next['maxOutputSize'] = metadata.maxOutputSize;
++  const efforts = metadata.efforts;
++  if (efforts === undefined) return next;
++  const levels = efforts.filter((effort) => effort !== 'none');
++  if (levels.length === 0) return next;
++  next['supportEfforts'] = levels;
++  // An explicit client default, not a claim about the provider's own default.
++  next['defaultEffort'] = levels.includes('high') ? 'high' : levels[Math.floor(levels.length / 2)];
++  const thinking = ['thinking'];
++  if (endpointType !== 'messages') {
++    if (efforts.includes('none')) next['offEffort'] = 'none';
++    else thinking.push('always_thinking');
++  }
++  next['capabilities'] = [
++    ...capabilityList(current['capabilities']).filter(
++      (capability) => !OWNED_CAPABILITIES.has(capability.trim().toLowerCase()),
++    ),
++    ...thinking,
++  ];
++  return next;
++}
++
++/**
++ * `[secondary_model].default_effort` is validated against every pool model
++ * when a session starts, so metadata that does not fit it would stop every
++ * session. Such an alias keeps its previous efforts until the effort is
++ * changed. The patched alias declares its thinking metadata in full, so the
++ * check below matches the engine's validation for it.
++ */
++interface SubagentEffort {
++  readonly effort: string;
++  readonly aliases: ReadonlySet<string>;
++}
++
++function secondaryModelEffort(config: ManagedKimiConfigShape): SubagentEffort | undefined {
++  const section = config['secondaryModel'];
++  if (!isRecord(section)) return undefined;
++  const effort = nonEmptyString(section['defaultEffort'])?.toLowerCase();
++  if (effort === undefined) return undefined;
++  const models = section['models'];
++  const fallback = nonEmptyString(section['defaultModel']) ?? nonEmptyString(section['model']);
++  const aliases = isRecord(models) ? Object.keys(models) : fallback === undefined ? [] : [fallback];
++  return { effort, aliases: new Set(aliases) };
++}
++
++function subagentEffortConflict(
++  subagent: SubagentEffort | undefined,
++  alias: string,
++  current: Record<string, unknown>,
++  patched: Record<string, unknown>,
++): string | undefined {
++  if (subagent === undefined || !subagent.aliases.has(alias)) return undefined;
++  if (JSON.stringify(thinkingFields(current)) === JSON.stringify(thinkingFields(patched))) {
++    return undefined;
++  }
++  const problem = subagentEffortProblem(subagent.effort, patched);
++  if (problem === undefined) return undefined;
++  return `[secondary_model] default_effort "${subagent.effort}" would no longer work with ${alias}: ${problem}. Change default_effort to apply CloseRouter's efforts; keeping its previous efforts.`;
++}
++
++function subagentEffortProblem(effort: string, alias: Record<string, unknown>): string | undefined {
++  const overrides = isRecord(alias['overrides']) ? alias['overrides'] : {};
++  const capabilities = new Set(
++    capabilityList(overrides['capabilities'] ?? alias['capabilities']).map((capability) =>
++      capability.trim().toLowerCase(),
++    ),
++  );
++  const alwaysThinking = capabilities.has('always_thinking');
++  const supportsThinking =
++    alwaysThinking ||
++    capabilities.has('thinking') ||
++    (overrides['adaptiveThinking'] ?? alias['adaptiveThinking']) === true;
++  const efforts = capabilityList(overrides['supportEfforts'] ?? alias['supportEfforts'])
++    .map((value) => value.trim())
++    .filter((value) => value.length > 0);
++  if (effort === 'off') return alwaysThinking ? 'it always reasons' : undefined;
++  if (!supportsThinking) return 'it does not support thinking';
++  if (efforts.length === 0 || effort === 'on' || efforts.includes(effort)) return undefined;
++  return `it supports ${efforts.join(', ')}`;
++}
++
++function thinkingFields(alias: Record<string, unknown>): unknown[] {
++  return [
++    capabilityList(alias['capabilities'])
++      .map((capability) => capability.trim().toLowerCase())
++      .filter((capability) => OWNED_CAPABILITIES.has(capability))
++      .toSorted(),
++    alias['supportEfforts'],
++    alias['defaultEffort'],
++    alias['offEffort'],
++  ];
++}
++
++function capabilityList(value: unknown): string[] {
++  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
++}
++
++function sameAlias(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
++  return JSON.stringify(canonicalAlias(a)) === JSON.stringify(canonicalAlias(b));
++}
++
++function canonicalAlias(alias: Record<string, unknown>): Record<string, unknown> {
++  const out: Record<string, unknown> = {};
++  for (const key of Object.keys(alias).toSorted()) {
++    const value = alias[key];
++    out[key] =
++      key === 'capabilities' && Array.isArray(value)
++        ? capabilityList(value).map((item) => item.trim().toLowerCase()).toSorted()
++        : value;
++  }
++  return out;
++}
++
++function sameMembers(a: readonly string[], b: readonly string[]): boolean {
++  return a.length === b.length && a.every((item) => b.includes(item));
++}
++
++function catalogId(modelId: string): string {
++  return modelId.replace(SERVICE_TIER_SUFFIX, '');
++}
++
++function positiveInteger(value: unknown): number | undefined {
++  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
++}
++
++async function getJson(client: MetadataClient, apiKey: string, path: string): Promise<unknown> {
++  // Messages end up in the TUI and in server logs; none may carry the key.
++  if (/[\u0000-\u001F\u007F]/.test(apiKey)) {
++    throw new Error('the API key contains control characters (such as a line break)');
++  }
++  const headers: Record<string, string> = {
++    Accept: 'application/json',
++    Authorization: `Bearer ${apiKey}`,
++  };
++  if (client.userAgent !== undefined) headers['User-Agent'] = client.userAgent;
++  let response: Response;
++  try {
++    response = await fetch(`${CLOSEROUTER_API_BASE}${path}`, {
++      headers,
++      // A redirect would forward the API key to wherever it points.
++      redirect: 'error',
++      signal: AbortSignal.any([client.deadline, AbortSignal.timeout(client.requestTimeoutMs)]),
++    });
++  } catch (error) {
++    // oxlint-disable-next-line preserve-caught-error -- the cause can carry the API key; its text is kept, redacted
++    throw new Error(withoutKey(errorMessage(error), apiKey));
++  }
++  if (!response.ok) {
++    throw new Error(withoutKey(await readApiErrorMessage(response, `HTTP ${response.status}`), apiKey));
++  }
++  let text: string;
++  try {
++    text = await response.text();
++  } catch (error) {
++    // oxlint-disable-next-line preserve-caught-error -- the cause can carry the API key; its text is kept, redacted
++    throw new Error(withoutKey(errorMessage(error), apiKey));
++  }
++  try {
++    return JSON.parse(text) as unknown;
++  } catch {
++    throw new Error('the response is not valid JSON');
++  }
++}
++
++function withoutKey(message: string, apiKey: string): string {
++  return message.split(apiKey).join('[redacted]');
++}
++
++async function mapWithConcurrency<T, R>(
++  items: readonly T[],
++  limit: number,
++  run: (item: T) => Promise<R>,
++): Promise<R[]> {
++  const results: R[] = [];
++  let next = 0;
++  const worker = async (): Promise<void> => {
++    while (next < items.length) {
++      const index = next++;
++      results[index] = await run(items[index]!);
++    }
++  };
++  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
++  return results;
++}
++
++function errorMessage(error: unknown): string {
++  if (!(error instanceof Error)) return String(error);
++  if (error.name === 'TimeoutError' || error.name === 'AbortError') return 'timed out';
++  // fetch reports DNS, TLS and refused redirects as "fetch failed" with the reason in `cause`.
++  const cause = error.cause instanceof Error ? error.cause.message : undefined;
++  return cause === undefined || cause === error.message ? error.message : `${error.message}: ${cause}`;
++}
+diff --git a/packages/oauth/src/refreshProviderModels.ts b/packages/oauth/src/refreshProviderModels.ts
+index e21648f49bbe417b040dccd649c5725ba562cc39..924cb4c344429ec31f91f59d1f364ba55924fad2 100644
+--- a/packages/oauth/src/refreshProviderModels.ts
++++ b/packages/oauth/src/refreshProviderModels.ts
+@@ -1,3 +1,4 @@
++import { refreshCloseRouterModels } from './closerouter';
+ import {
+   applyCustomRegistryProvider,
+   declaredUpgradeTarget,
+@@ -61,6 +62,8 @@ export interface ProviderChange {
+   readonly providerName: string;
+   readonly added: number;
+   readonly removed: number;
++  /** User-facing summary of a change that adds and removes no model, when worth showing. */
++  readonly detail?: string;
+ }
+ 
+ export interface RefreshResult {
+@@ -422,6 +425,8 @@ function pickDefaultModel(
+  * changes through the host. Handles four provider kinds, in order:
+  *
+  *  1. Managed Kimi Code (OAuth) — `GET /models` against the runtime endpoint.
++ *  1.5. CloseRouter — limits and endpoint efforts of the configured aliases
++ *     whose endpoint is CloseRouter; never adds or removes aliases.
+  *  2. Open platforms (moonshot-cn, moonshot-ai, …) — platform catalog fetch.
+  *  2.5. Managed-endpoint API-key providers — hand-written `type: 'kimi'`
+  *     providers (including a hand-written `managed:kimi-code` without an oauth
+@@ -536,6 +541,32 @@ export async function refreshProviderModels(
+     return { changed, unchanged, failed };
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // 1.5. CloseRouter (CustomKIMI): limits and endpoint efforts of the
++  //      configured aliases, never the whole catalog (see ./closerouter).
++  // ---------------------------------------------------------------------------
++  try {
++    const closeRouter = await refreshCloseRouterModels(host, config, { providerId: targetId });
++    config = closeRouter.config;
++    for (const { providerId, aliases, limits, efforts } of closeRouter.changed) {
++      const what = limits && efforts ? 'limits and efforts' : efforts ? 'efforts' : 'limits';
++      changed.push({
++        providerId,
++        providerName: providerId,
++        added: 0,
++        removed: 0,
++        detail: `${what} of ${String(aliases)} model${aliases === 1 ? '' : 's'} updated from CloseRouter`,
++      });
++    }
++    unchanged.push(...closeRouter.unchanged);
++    failed.push(...closeRouter.failed);
++  } catch (error) {
++    failed.push({
++      provider: targetId ?? 'closerouter',
++      reason: error instanceof Error ? error.message : String(error),
++    });
++  }
++
+   // ---------------------------------------------------------------------------
+   // 2. Open Platforms (moonshot-cn, moonshot-ai, …)
+   // ---------------------------------------------------------------------------
+diff --git a/packages/oauth/test/closerouter.test.ts b/packages/oauth/test/closerouter.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..32b3693e5872ac535fd9b6427b786066a0217887
+--- /dev/null
++++ b/packages/oauth/test/closerouter.test.ts
+@@ -0,0 +1,902 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++import { closeRouterApiBase, refreshCloseRouterModels } from '../src/closerouter';
++import type { ManagedKimiConfigShape } from '../src/managed-kimi-code';
++import { refreshProviderModels, type RefreshProviderHost } from '../src/refreshProviderModels';
++
++const KEY_ENV = 'CLOSEROUTER_TEST_KEY';
++const API = 'https://api.closerouter.dev/v1';
++
++const ASTRA = 'openai/gpt-6-astra';
++const SOL = 'openai/gpt-5.6-sol';
++const DEEPSEEK = 'deepseek/deepseek-v4-pro-0813';
++const OPUS = 'anthropic/claude-opus-4.8';
++
++const CATALOG = [
++  { id: ASTRA, context_length: 786432, max_output_tokens: 128000 },
++  { id: SOL, context_length: 786432, max_output_tokens: 128000 },
++  { id: DEEPSEEK, context_length: 1000000, max_output_tokens: 65536 },
++  { id: OPUS, context_length: 200000, max_output_tokens: 32000 },
++  { id: 'example/not-configured', context_length: 1, max_output_tokens: 1 },
++];
++
++const ENDPOINTS: Record<string, unknown[]> = {
++  [ASTRA]: [
++    { type: 'chat', supports_streaming: true, supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
++    { type: 'responses', supports_streaming: true, supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
++  ],
++  [SOL]: [
++    {
++      type: 'chat',
++      supports_streaming: true,
++      supported_reasoning_efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++    },
++  ],
++  [DEEPSEEK]: [{ type: 'chat', supports_streaming: true, supported_reasoning_efforts: ['low', 'high', 'max'] }],
++  [OPUS]: [
++    {
++      type: 'messages',
++      supports_streaming: true,
++      supported_reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++    },
++    { type: 'chat', supports_streaming: true, supported_reasoning_efforts: ['none', 'low', 'high'] },
++  ],
++};
++
++interface Call {
++  readonly url: string;
++  readonly init: RequestInit;
++}
++
++type Route = (url: string) => Response | Promise<Response>;
++
++function stubFetch(route: Route = defaultRoute): Call[] {
++  const calls: Call[] = [];
++  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
++    calls.push({ url, init });
++    return route(url);
++  });
++  return calls;
++}
++
++function defaultRoute(url: string): Response {
++  if (url === `${API}/models`) return Response.json({ data: CATALOG });
++  const match = /^https:\/\/api\.closerouter\.dev\/v1\/models\/(.+)\/endpoints$/.exec(url);
++  const id = match === null ? undefined : decodeURIComponent(match[1]!);
++  const endpoints = id === undefined ? undefined : ENDPOINTS[id];
++  if (endpoints === undefined) return Response.json({ error: { message: 'not found' } }, { status: 404 });
++  return Response.json({ data: { id, endpoints } });
++}
++
++function baseConfig(): ManagedKimiConfigShape {
++  return {
++    providers: {
++      closerouter: { type: 'openai', baseUrl: 'https://api.closerouter.dev/v1', apiKeyEnv: KEY_ENV },
++      'closerouter-anthropic': { type: 'anthropic', baseUrl: 'https://api.closerouter.dev', apiKeyEnv: KEY_ENV },
++      other: { type: 'openai', baseUrl: 'https://example.test/v1', apiKey: 'other-key' },
++    },
++    defaultModel: 'closerouter/astra',
++    thinking: { enabled: false, effort: 'high' },
++    secondaryModel: { defaultModel: 'closerouter/astra', defaultEffort: 'high' },
++    models: {
++      'closerouter/astra': {
++        provider: 'closerouter',
++        model: ASTRA,
++        maxContextSize: 1000000,
++        maxOutputSize: 32000,
++        overrides: { maxOutputSize: 32000 },
++      },
++      'closerouter/sol': { provider: 'closerouter', model: SOL, maxContextSize: 1000000, capabilities: ['tool_use'] },
++      'closerouter/deepseek': { provider: 'closerouter', model: DEEPSEEK, maxContextSize: 1000000 },
++      'closerouter-anthropic/opus': {
++        provider: 'closerouter-anthropic',
++        model: OPUS,
++        maxContextSize: 200000,
++        maxOutputSize: 32000,
++      },
++      'other/model': { provider: 'other', model: 'other-model', maxContextSize: 1000 },
++    },
++  };
++}
++
++interface MemoryHost extends RefreshProviderHost {
++  readonly writes: ManagedKimiConfigShape[];
++  current(): ManagedKimiConfigShape;
++  edit(change: (config: ManagedKimiConfigShape) => void): void;
++}
++
++function memoryHost(initial: ManagedKimiConfigShape): MemoryHost {
++  let config = structuredClone(initial);
++  const writes: ManagedKimiConfigShape[] = [];
++  return {
++    writes,
++    current: () => config,
++    edit: (change) => {
++      change(config);
++    },
++    getConfig: async () => structuredClone(config),
++    setConfig: async (patch) => {
++      writes.push(structuredClone(patch));
++      const { models, ...rest } = structuredClone(patch);
++      config = { ...config, ...rest };
++      if (models !== undefined) {
++        // Like the real config writer: written aliases replace the section,
++        // but a key missing from a written alias keeps its stored value.
++        config.models = Object.fromEntries(
++          Object.entries(models).map(([alias, model]) => [
++            alias,
++            { ...(config.models?.[alias] as Record<string, unknown> | undefined), ...model },
++          ]),
++        );
++      }
++      return structuredClone(config);
++    },
++    removeProvider: async () => {
++      throw new Error('a CloseRouter refresh must never remove a provider');
++    },
++    resolveOAuthToken: async () => {
++      throw new Error('a CloseRouter refresh needs no OAuth token');
++    },
++    userAgent: 'kimi-code-cli/test',
++  };
++}
++
++function model(config: ManagedKimiConfigShape, alias: string): Record<string, unknown> {
++  return config.models![alias] as Record<string, unknown>;
++}
++
++beforeEach(() => {
++  vi.stubEnv(KEY_ENV, 'test-key');
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.unstubAllEnvs();
++});
++
++describe('closeRouterApiBase', () => {
++  it.each([
++    'https://api.closerouter.dev',
++    'https://api.closerouter.dev/',
++    'https://api.closerouter.dev/v1',
++    'https://api.closerouter.dev/v1/',
++    'https://API.closerouter.dev/v1',
++  ])('accepts %s', (baseUrl) => {
++    expect(closeRouterApiBase(baseUrl)).toBe(API);
++  });
++
++  it.each([
++    'http://api.closerouter.dev/v1',
++    'https://api.closerouter.dev:8443/v1',
++    'https://user:secret@api.closerouter.dev/v1',
++    'https://api.closerouter.dev/v1?x=1',
++    'https://api.closerouter.dev/v1#x',
++    'https://api.closerouter.dev/v2',
++    'https://api.closerouter.dev/v1/chat',
++    'https://api.closerouter.dev.evil.test/v1',
++    'https://evil.test/api.closerouter.dev/v1',
++    'not a url',
++    '',
++    undefined,
++  ])('rejects %s', (baseUrl) => {
++    expect(closeRouterApiBase(baseUrl)).toBeUndefined();
++  });
++});
++
++describe('CloseRouter metadata refresh', () => {
++  it('refreshes configured aliases per endpoint without importing the catalog or touching other settings', async () => {
++    const calls = stubFetch();
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([]);
++    expect(result.changed.toSorted((a, b) => a.providerId.localeCompare(b.providerId))).toEqual([
++      {
++        providerId: 'closerouter',
++        providerName: 'closerouter',
++        added: 0,
++        removed: 0,
++        detail: 'limits and efforts of 3 models updated from CloseRouter',
++      },
++      {
++        providerId: 'closerouter-anthropic',
++        providerName: 'closerouter-anthropic',
++        added: 0,
++        removed: 0,
++        detail: 'efforts of 1 model updated from CloseRouter',
++      },
++    ]);
++    const config = host.current();
++    expect(Object.keys(config.models!)).toEqual(Object.keys(baseConfig().models!));
++    expect(config.defaultModel).toBe('closerouter/astra');
++    expect(config.thinking).toEqual({ enabled: false, effort: 'high' });
++    expect(config['secondaryModel']).toEqual({ defaultModel: 'closerouter/astra', defaultEffort: 'high' });
++    expect(config.providers).toEqual(baseConfig().providers);
++    expect(model(config, 'other/model')).toEqual(model(baseConfig(), 'other/model'));
++
++    // Chat without `none`: reasoning cannot be turned off on the wire.
++    expect(model(config, 'closerouter/astra')).toEqual({
++      provider: 'closerouter',
++      model: ASTRA,
++      maxContextSize: 786432,
++      maxOutputSize: 128000,
++      overrides: { maxOutputSize: 32000 },
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
++      defaultEffort: 'high',
++      capabilities: ['thinking', 'always_thinking'],
++    });
++    // Chat with `none`: "off" is sent as the explicit `none` effort.
++    expect(model(config, 'closerouter/sol')).toMatchObject({
++      maxContextSize: 786432,
++      maxOutputSize: 128000,
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++      defaultEffort: 'high',
++      offEffort: 'none',
++      capabilities: ['tool_use', 'thinking'],
++    });
++    expect(model(config, 'closerouter/deepseek')).toMatchObject({
++      maxOutputSize: 65536,
++      supportEfforts: ['low', 'high', 'max'],
++      defaultEffort: 'high',
++      capabilities: ['thinking', 'always_thinking'],
++    });
++    // Messages keeps native Anthropic thinking: no always_thinking or off effort
++    // inferred from the missing `none`, and the provider base without /v1 works.
++    const opus = model(config, 'closerouter-anthropic/opus');
++    expect(opus).toMatchObject({
++      maxContextSize: 200000,
++      maxOutputSize: 32000,
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++      defaultEffort: 'high',
++      capabilities: ['thinking'],
++    });
++    expect(opus).not.toHaveProperty('offEffort');
++
++    const urls = calls.map((call) => call.url).toSorted();
++    expect(urls).toEqual(
++      [
++        `${API}/models`,
++        `${API}/models/anthropic/claude-opus-4.8/endpoints`,
++        `${API}/models/deepseek/deepseek-v4-pro-0813/endpoints`,
++        `${API}/models/openai/gpt-5.6-sol/endpoints`,
++        `${API}/models/openai/gpt-6-astra/endpoints`,
++      ].toSorted(),
++    );
++    for (const call of calls) {
++      expect(new Headers(call.init.headers).get('authorization')).toBe('Bearer test-key');
++      expect(new Headers(call.init.headers).get('user-agent')).toBe('kimi-code-cli/test');
++      expect(call.init.redirect).toBe('error');
++      expect(call.init.signal).toBeInstanceOf(AbortSignal);
++    }
++    expect(host.writes).toHaveLength(1);
++    expect(Object.keys(host.writes[0]!)).toEqual(['models']);
++  });
++
++  it('writes nothing and reports the providers unchanged when the metadata is already current', async () => {
++    stubFetch();
++    const host = memoryHost(baseConfig());
++    await refreshProviderModels(host);
++    const writes = host.writes.length;
++
++    const second = await refreshProviderModels(host);
++
++    expect(host.writes).toHaveLength(writes);
++    expect(second.changed).toEqual([]);
++    expect(second.unchanged.toSorted()).toEqual(['closerouter', 'closerouter-anthropic']);
++  });
++
++  it('follows per-model base URL and protocol overrides instead of the provider record', async () => {
++    const calls = stubFetch();
++    const config = baseConfig();
++    config.models = {
++      'other/astra-responses': {
++        provider: 'other',
++        model: ASTRA,
++        maxContextSize: 1,
++        baseUrl: 'https://api.closerouter.dev/v1',
++        protocol: 'openai_responses',
++        apiKey: 'model-key',
++      },
++      'closerouter/opus-messages': { provider: 'closerouter', model: OPUS, maxContextSize: 1, protocol: 'anthropic' },
++      'closerouter/proxied': {
++        provider: 'closerouter',
++        model: DEEPSEEK,
++        maxContextSize: 1,
++        baseUrl: 'https://example.test/v1',
++      },
++    };
++    const host = memoryHost(config);
++
++    await refreshProviderModels(host);
++
++    const refreshed = host.current();
++    expect(model(refreshed, 'other/astra-responses')).toMatchObject({
++      maxContextSize: 786432,
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
++      capabilities: ['thinking', 'always_thinking'],
++    });
++    expect(model(refreshed, 'closerouter/opus-messages')).toMatchObject({
++      supportEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
++      capabilities: ['thinking'],
++    });
++    expect(model(refreshed, 'closerouter/proxied')).toEqual(config.models['closerouter/proxied']);
++    expect(calls.some((call) => call.url.includes('deepseek'))).toBe(false);
++    expect(
++      calls.filter((call) => new Headers(call.init.headers).get('authorization') === 'Bearer model-key').length,
++    ).toBeGreaterThan(0);
++  });
++
++  it("never sends another provider's key to CloseRouter for an alias that only re-routes it", async () => {
++    const calls = stubFetch();
++    const config = baseConfig();
++    config.models = {
++      'other/astra': { provider: 'other', model: ASTRA, maxContextSize: 1, baseUrl: 'https://api.closerouter.dev/v1' },
++    };
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(calls).toEqual([]);
++    expect(host.writes).toEqual([]);
++    expect(result.failed).toEqual([
++      { provider: 'other', reason: expect.stringContaining("give it a provider whose base_url is CloseRouter") },
++    ]);
++  });
++
++  it("never sends the key of a provider on its vendor's default endpoint to CloseRouter", async () => {
++    const calls = stubFetch();
++    const rerouted = { maxContextSize: 1, baseUrl: 'https://api.closerouter.dev/v1' };
++    const host = memoryHost({
++      providers: {
++        openai: { type: 'openai', apiKeyEnv: KEY_ENV },
++        table: { type: 'openai', env: { OPENAI_API_KEY: 'table-key' } },
++        anthropic: { type: 'anthropic', apiKey: 'inline-key' },
++      },
++      models: {
++        astra: { provider: 'openai', model: ASTRA, ...rerouted },
++        sol: { provider: 'table', model: SOL, ...rerouted },
++        opus: { provider: 'anthropic', model: OPUS, ...rerouted },
++      },
++    });
++
++    const result = await refreshProviderModels(host);
++
++    expect(calls).toEqual([]);
++    expect(host.writes).toEqual([]);
++    expect(result.failed.map((failure) => failure.provider).toSorted()).toEqual(['anthropic', 'openai', 'table']);
++    for (const failure of result.failed) {
++      expect(failure.reason).toContain('give it a provider whose base_url is CloseRouter');
++    }
++  });
++
++  it("uses a provider's key for a re-routed alias when the provider's env table points at CloseRouter", async () => {
++    const calls = stubFetch();
++    const host = memoryHost({
++      providers: {
++        router: { type: 'openai', apiKeyEnv: KEY_ENV, env: { OPENAI_BASE_URL: 'https://api.closerouter.dev/v1' } },
++      },
++      models: { astra: { provider: 'router', model: ASTRA, maxContextSize: 1, baseUrl: 'https://api.closerouter.dev/v1' } },
++    });
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([]);
++    expect(new Headers(calls[0]!.init.headers).get('authorization')).toBe('Bearer test-key');
++    expect(model(host.current(), 'astra')).toMatchObject({ maxContextSize: 786432 });
++  });
++
++  it('never puts the API key into a reported failure', async () => {
++    vi.stubEnv(KEY_ENV, 'secret\nkey');
++    const calls = stubFetch();
++    const broken = await refreshProviderModels(memoryHost(baseConfig()));
++    expect(calls).toEqual([]);
++    expect(broken.failed[0]!.reason).toContain('control characters');
++    expect(JSON.stringify(broken.failed)).not.toContain('secret');
++
++    vi.stubEnv(KEY_ENV, 'secret-key-123');
++    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
++      if (String(new Headers(init.headers).get('authorization')).includes('secret-key-123')) {
++        throw new TypeError('fetch failed', { cause: new Error('header rejected: Bearer secret-key-123') });
++      }
++      return Response.json({});
++    });
++    const leaky = await refreshProviderModels(memoryHost(baseConfig()));
++    expect(leaky.failed.length).toBeGreaterThan(0);
++    expect(JSON.stringify(leaky.failed)).not.toContain('secret-key-123');
++    expect(leaky.failed[0]!.reason).toContain('Bearer [redacted]');
++
++    vi.stubGlobal('fetch', async () =>
++      Response.json({ error: { message: 'invalid key secret-key-123' } }, { status: 401 }),
++    );
++    const echoed = await refreshProviderModels(memoryHost(baseConfig()));
++    expect(echoed.failed[0]!.reason).toContain('invalid key [redacted]');
++  });
++
++  it('reads the key the runtime would use from the provider env table of its type', async () => {
++    const calls = stubFetch();
++    const host = memoryHost({
++      providers: {
++        router: { type: 'openai', baseUrl: 'https://api.closerouter.dev', env: { OPENAI_API_KEY: 'env-table-key' } },
++      },
++      models: { opus: { provider: 'router', model: OPUS, maxContextSize: 1, protocol: 'anthropic' } },
++    });
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([]);
++    expect(new Headers(calls[0]!.init.headers).get('authorization')).toBe('Bearer env-table-key');
++    expect(model(host.current(), 'opus')['supportEfforts']).toHaveLength(6);
++  });
++
++  it('leaves OAuth models and the KIMI_MODEL_* environment model alone', async () => {
++    const calls = stubFetch();
++    const host = memoryHost({
++      providers: {
++        closerouter: { type: 'openai', baseUrl: 'https://api.closerouter.dev/v1', apiKeyEnv: KEY_ENV },
++        __kimi_env__: { type: 'openai', baseUrl: 'https://api.closerouter.dev/v1', apiKey: 'env-model-key' },
++      },
++      models: {
++        oauthed: { provider: 'closerouter', model: ASTRA, maxContextSize: 1, oauth: { storage: 'file', key: 'k' } },
++        __kimi_env_model__: { provider: '__kimi_env__', model: SOL, maxContextSize: 1 },
++      },
++    });
++
++    const result = await refreshProviderModels(host);
++
++    expect(calls).toEqual([]);
++    expect(result).toEqual({ changed: [], unchanged: [], failed: [] });
++  });
++
++  it('keeps unrelated capabilities and owns only the thinking tags', async () => {
++    stubFetch();
++    const config = baseConfig();
++    config.models = {
++      opus: {
++        provider: 'closerouter-anthropic',
++        model: OPUS,
++        maxContextSize: 1,
++        capabilities: ['image_in', 'always_thinking'],
++      },
++      astra: { provider: 'closerouter', model: ASTRA, maxContextSize: 1, capabilities: ['THINKING', 'tool_use'] },
++    };
++    const host = memoryHost(config);
++
++    await refreshProviderModels(host);
++
++    expect(model(host.current(), 'opus')['capabilities']).toEqual(['image_in', 'thinking']);
++    expect(model(host.current(), 'astra')['capabilities']).toEqual(['tool_use', 'thinking', 'always_thinking']);
++  });
++
++  it('sends nothing for statically sourced providers or when scoped to another provider', async () => {
++    const calls = stubFetch();
++    const config = baseConfig();
++    (config.providers['closerouter'] as Record<string, unknown>)['modelSource'] = 'static';
++    const host = memoryHost(config);
++
++    await refreshProviderModels(host, { providerId: 'other' });
++    expect(calls).toEqual([]);
++
++    await refreshProviderModels(host, { providerId: 'closerouter' });
++    expect(calls).toEqual([]);
++
++    await refreshProviderModels(host, { providerId: 'closerouter-anthropic' });
++    expect(calls.map((call) => call.url).toSorted()).toEqual(
++      [`${API}/models`, `${API}/models/anthropic/claude-opus-4.8/endpoints`].toSorted(),
++    );
++    expect(model(host.current(), 'closerouter/astra')).toEqual(model(config, 'closerouter/astra'));
++  });
++
++  it('reports a missing API key without any request', async () => {
++    vi.stubEnv(KEY_ENV, '');
++    const calls = stubFetch();
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(calls).toEqual([]);
++    expect(host.writes).toEqual([]);
++    expect(result.failed.map((failure) => failure.provider).toSorted()).toEqual([
++      'closerouter',
++      'closerouter-anthropic',
++    ]);
++    expect(result.failed[0]!.reason).toContain(KEY_ENV);
++    expect(result.failed[0]!.reason).not.toContain('test-key');
++  });
++
++  it.each([
++    ['an HTTP error', () => Response.json({ error: { message: 'invalid api key' } }, { status: 401 }), 'invalid api key'],
++    ['a network error', () => Promise.reject(new TypeError('fetch failed')), 'fetch failed'],
++    ['invalid JSON', () => new Response('<html>', { status: 200 }), 'not valid JSON'],
++    ['a catalog without data', () => Response.json({ models: [] }), 'without a data list'],
++  ])('keeps the last-good metadata and reports %s from the catalog', async (_name, catalog, reason) => {
++    stubFetch((url) => (url === `${API}/models` ? catalog() : defaultRoute(url)));
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(host.writes).toEqual([]);
++    expect(host.current()).toEqual(baseConfig());
++    expect(result.changed).toEqual([]);
++    expect(result.failed.map((failure) => failure.provider).toSorted()).toEqual([
++      'closerouter',
++      'closerouter-anthropic',
++    ]);
++    expect(result.failed[0]!.reason).toContain(reason);
++  });
++
++  it('updates catalog limits but keeps last-good efforts when endpoint details fail', async () => {
++    stubFetch((url) =>
++      url.includes('gpt-6-astra') ? Response.json({}, { status: 503 }) : defaultRoute(url),
++    );
++    const config = baseConfig();
++    model(config, 'closerouter/astra')['supportEfforts'] = ['high'];
++    model(config, 'closerouter/astra')['defaultEffort'] = 'high';
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/astra')).toEqual({
++      ...model(config, 'closerouter/astra'),
++      maxContextSize: 786432,
++      maxOutputSize: 128000,
++    });
++    expect(model(host.current(), 'closerouter/sol')['supportEfforts']).toHaveLength(6);
++    expect(result.failed).toEqual([
++      { provider: 'closerouter', reason: expect.stringContaining(`${ASTRA} failed (HTTP 503)`) },
++    ]);
++  });
++
++  it('reports models missing from the catalog, endpoints and invalid limits while keeping their metadata', async () => {
++    const calls = stubFetch((url) => {
++      if (url === `${API}/models`) {
++        return Response.json({
++          data: [
++            { id: ASTRA, context_length: 'large', max_output_tokens: null },
++            { id: SOL, context_length: 786432, max_output_tokens: 128000 },
++            { id: OPUS, context_length: 200000, max_output_tokens: 32000 },
++          ],
++        });
++      }
++      if (url.includes('claude-opus')) {
++        return Response.json({ data: { endpoints: [{ type: 'chat', supported_reasoning_efforts: ['low'] }] } });
++      }
++      return defaultRoute(url);
++    });
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    const config = host.current();
++    expect(model(config, 'closerouter/astra')).toMatchObject({ maxContextSize: 1000000, maxOutputSize: 32000 });
++    expect(model(config, 'closerouter/astra')['supportEfforts']).toHaveLength(5);
++    expect(model(config, 'closerouter/deepseek')).toEqual(model(baseConfig(), 'closerouter/deepseek'));
++    expect(model(config, 'closerouter-anthropic/opus')).toMatchObject({ maxContextSize: 200000 });
++    expect(model(config, 'closerouter-anthropic/opus')).not.toHaveProperty('supportEfforts');
++    expect(calls.some((call) => call.url.includes('deepseek'))).toBe(false);
++    expect(result.failed).toEqual(
++      expect.arrayContaining([
++        { provider: 'closerouter', reason: expect.stringContaining(`no valid context_length for ${ASTRA}`) },
++        { provider: 'closerouter', reason: expect.stringContaining(`${DEEPSEEK} is not in the CloseRouter catalog`) },
++        { provider: 'closerouter-anthropic', reason: expect.stringContaining(`no Messages endpoint for ${OPUS}`) },
++      ]),
++    );
++    expect(result.failed).toHaveLength(3);
++  });
++
++  it('treats conflicting endpoint entries as ambiguous but accepts identical duplicates', async () => {
++    stubFetch((url) => {
++      if (url.includes('gpt-6-astra')) {
++        return Response.json({
++          data: {
++            endpoints: [
++              { type: 'chat', supported_reasoning_efforts: ['low', 'high'] },
++              { type: 'chat', supported_reasoning_efforts: ['low', 'high', 'max'] },
++            ],
++          },
++        });
++      }
++      if (url.includes('deepseek')) {
++        return Response.json({
++          data: {
++            endpoints: [
++              { type: 'chat', supported_reasoning_efforts: ['max', 'low', 'high'] },
++              { type: 'chat', supported_reasoning_efforts: ['low', 'high', 'max'] },
++            ],
++          },
++        });
++      }
++      return defaultRoute(url);
++    });
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/astra')).not.toHaveProperty('supportEfforts');
++    expect(model(host.current(), 'closerouter/deepseek')['supportEfforts']).toEqual(['low', 'high', 'max']);
++    expect(result.failed).toEqual([
++      { provider: 'closerouter', reason: expect.stringContaining(`conflicting reasoning efforts for ${ASTRA}`) },
++    ]);
++  });
++
++  it('rejects malformed effort lists, keeps unknown levels in API order and skips non-streaming endpoints', async () => {
++    stubFetch((url) => {
++      if (url.includes('gpt-6-astra')) {
++        return Response.json({ data: { endpoints: [{ type: 'chat', supported_reasoning_efforts: ['low', 7] }] } });
++      }
++      if (url.includes('deepseek')) {
++        return Response.json({
++          data: { endpoints: [{ type: 'chat', supported_reasoning_efforts: ['turbo', 'low', 'high'] }] },
++        });
++      }
++      if (url.includes('gpt-5.6-sol')) {
++        return Response.json({
++          data: { endpoints: [{ type: 'chat', supports_streaming: false, supported_reasoning_efforts: ['low'] }] },
++        });
++      }
++      return defaultRoute(url);
++    });
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/astra')).not.toHaveProperty('supportEfforts');
++    expect(model(host.current(), 'closerouter/deepseek')['supportEfforts']).toEqual(['turbo', 'low', 'high']);
++    expect(model(host.current(), 'closerouter/sol')).toMatchObject({ maxContextSize: 786432, capabilities: ['tool_use'] });
++    expect(model(host.current(), 'closerouter/sol')).not.toHaveProperty('supportEfforts');
++    expect(result.failed).toEqual([
++      { provider: 'closerouter', reason: expect.stringContaining(`invalid supported_reasoning_efforts for ${ASTRA}`) },
++      { provider: 'closerouter', reason: expect.stringContaining(`${SOL} (Chat Completions) does not stream`) },
++    ]);
++  });
++
++  it('only applies an empty effort list when there is nothing to keep', async () => {
++    stubFetch((url) =>
++      url.includes('/endpoints')
++        ? Response.json({ data: { endpoints: [{ type: 'chat', supported_reasoning_efforts: ['none'] }] } })
++        : defaultRoute(url),
++    );
++    const config = baseConfig();
++    model(config, 'closerouter/sol')['supportEfforts'] = ['low', 'high'];
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/sol')).toMatchObject({ supportEfforts: ['low', 'high'] });
++    expect(model(host.current(), 'closerouter/astra')).not.toHaveProperty('supportEfforts');
++    expect(model(host.current(), 'closerouter/astra')).not.toHaveProperty('capabilities');
++    expect(result.failed.filter((failure) => failure.reason.includes('no reasoning effort levels'))).toEqual([
++      { provider: 'closerouter', reason: expect.stringContaining(SOL) },
++    ]);
++  });
++
++  it('treats a missing effort list as a model without efforts, not as an error', async () => {
++    stubFetch((url) =>
++      url.includes('/endpoints') ? Response.json({ data: { endpoints: [{ type: 'chat' }] } }) : defaultRoute(url),
++    );
++    const config = baseConfig();
++    config.models = { plain: { provider: 'closerouter', model: ASTRA, maxContextSize: 1 } };
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([]);
++    expect(model(host.current(), 'plain')).toEqual({
++      provider: 'closerouter',
++      model: ASTRA,
++      maxContextSize: 786432,
++      maxOutputSize: 128000,
++    });
++  });
++
++  it('looks service-tier variants up by their base model id', async () => {
++    const calls = stubFetch();
++    const config = baseConfig();
++    config.models = { sol: { provider: 'closerouter', model: `${SOL}:priority`, maxContextSize: 1 } };
++    const host = memoryHost(config);
++
++    await refreshProviderModels(host);
++
++    expect(model(host.current(), 'sol')).toMatchObject({ model: `${SOL}:priority`, maxContextSize: 786432 });
++    expect(calls.map((call) => call.url)).toContain(`${API}/models/openai/gpt-5.6-sol/endpoints`);
++  });
++
++  it('merges into the config as edited during the requests', async () => {
++    const config = baseConfig();
++    const host = memoryHost(config);
++    stubFetch((url) => {
++      if (url === `${API}/models`) {
++        host.edit((current) => {
++          current.thinking = { enabled: true, effort: 'low' };
++          current.defaultModel = 'closerouter/sol';
++          const astra = current.models!['closerouter/astra'] as Record<string, unknown>;
++          astra['overrides'] = { maxOutputSize: 1000, supportEfforts: ['low', 'high'] };
++          astra['displayName'] = 'Astra (edited)';
++          delete current.models!['closerouter/deepseek'];
++          current.models!['closerouter/new'] = { provider: 'closerouter', model: 'example/new', maxContextSize: 5 };
++          current.models!['closerouter-anthropic/opus'] = {
++            provider: 'closerouter-anthropic',
++            model: 'anthropic/claude-opus-4.6',
++            maxContextSize: 7,
++          };
++        });
++      }
++      return defaultRoute(url);
++    });
++
++    const result = await refreshProviderModels(host);
++
++    const refreshed = host.current();
++    expect(refreshed.thinking).toEqual({ enabled: true, effort: 'low' });
++    expect(refreshed.defaultModel).toBe('closerouter/sol');
++    expect(model(refreshed, 'closerouter/astra')).toMatchObject({
++      displayName: 'Astra (edited)',
++      overrides: { maxOutputSize: 1000, supportEfforts: ['low', 'high'] },
++      maxContextSize: 786432,
++    });
++    expect(refreshed.models).not.toHaveProperty('closerouter/deepseek');
++    expect(model(refreshed, 'closerouter/new')).toEqual({ provider: 'closerouter', model: 'example/new', maxContextSize: 5 });
++    expect(model(refreshed, 'closerouter-anthropic/opus')).toEqual({
++      provider: 'closerouter-anthropic',
++      model: 'anthropic/claude-opus-4.6',
++      maxContextSize: 7,
++    });
++    expect(result.failed).toEqual([]);
++  });
++
++  it('fetches each model once, bounds concurrent requests and gives up on hanging ones', async () => {
++    let inFlight = 0;
++    let peak = 0;
++    const calls: string[] = [];
++    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
++      calls.push(url);
++      if (url.endsWith('/models')) return defaultRoute(url);
++      inFlight++;
++      peak = Math.max(peak, inFlight);
++      try {
++        if (url.includes('deepseek')) {
++          await new Promise((_resolve, reject) => {
++            init.signal!.addEventListener(
++              'abort',
++              () => {
++                reject(init.signal!.reason);
++              },
++              { once: true },
++            );
++          });
++        }
++        await new Promise((resolve) => setTimeout(resolve, 5));
++        return defaultRoute(url);
++      } finally {
++        inFlight--;
++      }
++    });
++    const config = baseConfig();
++    config.models!['duplicate/astra'] = { provider: 'closerouter', model: ASTRA, maxContextSize: 1 };
++    const host = memoryHost(config);
++
++    const result = await refreshCloseRouterModels(host, config, { concurrency: 2, requestTimeoutMs: 50 });
++
++    expect(peak).toBeLessThanOrEqual(2);
++    expect(calls.filter((url) => url.includes('gpt-6-astra'))).toHaveLength(1);
++    expect(calls.filter((url) => url.endsWith('/models'))).toHaveLength(1);
++    expect(result.failed).toEqual([
++      { provider: 'closerouter', reason: expect.stringContaining(`${DEEPSEEK} failed (timed out)`) },
++    ]);
++    expect(model(host.current(), 'duplicate/astra')['supportEfforts']).toHaveLength(5);
++  });
++
++  it('stops all requests at the refresh deadline', async () => {
++    vi.stubGlobal(
++      'fetch',
++      (_url: string, init: RequestInit) =>
++        new Promise((_resolve, reject) => {
++          init.signal!.addEventListener(
++            'abort',
++            () => {
++              reject(init.signal!.reason);
++            },
++            { once: true },
++          );
++        }),
++    );
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshCloseRouterModels(host, baseConfig(), { deadlineMs: 30 });
++
++    expect(host.writes).toEqual([]);
++    expect(result.failed.length).toBeGreaterThan(0);
++    expect(result.failed.every((failure) => failure.reason.includes('timed out'))).toBe(true);
++  });
++
++  it('keeps an alias\'s previous efforts when they would break [secondary_model].default_effort', async () => {
++    stubFetch();
++    const config = baseConfig();
++    config['secondaryModel'] = {
++      defaultModel: 'closerouter/sol',
++      models: { 'closerouter/astra': '', 'closerouter/deepseek': '', 'closerouter/sol': '' },
++      defaultEffort: 'Off',
++    };
++    const host = memoryHost(config);
++
++    const off = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/astra')).toMatchObject({ maxContextSize: 786432 });
++    expect(model(host.current(), 'closerouter/astra')).not.toHaveProperty('capabilities');
++    expect(model(host.current(), 'closerouter/sol')).toMatchObject({ offEffort: 'none', capabilities: ['tool_use', 'thinking'] });
++    expect(off.failed.map((failure) => failure.reason)).toEqual([
++      expect.stringContaining('default_effort "off" would no longer work with closerouter/astra: it always reasons'),
++      expect.stringContaining('default_effort "off" would no longer work with closerouter/deepseek: it always reasons'),
++    ]);
++
++    host.edit((current) => {
++      current['secondaryModel'] = { ...(current['secondaryModel'] as object), defaultEffort: 'medium' };
++    });
++    const medium = await refreshProviderModels(host);
++
++    expect(model(host.current(), 'closerouter/astra')['supportEfforts']).toHaveLength(5);
++    expect(model(host.current(), 'closerouter/deepseek')).not.toHaveProperty('supportEfforts');
++    expect(medium.failed).toEqual([
++      {
++        provider: 'closerouter',
++        reason: expect.stringContaining('"medium" would no longer work with closerouter/deepseek: it supports low, high, max'),
++      },
++    ]);
++  });
++
++  it('applies efforts to pool models when [secondary_model].default_effort still fits', async () => {
++    stubFetch();
++    const config = baseConfig();
++    config['secondaryModel'] = { defaultModel: 'closerouter/astra', defaultEffort: 'high' };
++    const host = memoryHost(config);
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed).toEqual([]);
++    expect(model(host.current(), 'closerouter/astra')).toMatchObject({ capabilities: ['thinking', 'always_thinking'] });
++  });
++
++  it('turns an alias that lost its none effort into always_thinking, leaving the unused off effort', async () => {
++    stubFetch();
++    const config = baseConfig();
++    config.models = {
++      astra: { provider: 'closerouter', model: ASTRA, maxContextSize: 1, offEffort: 'none', capabilities: ['thinking'] },
++    };
++    const host = memoryHost(config);
++
++    await refreshProviderModels(host);
++
++    expect(model(host.current(), 'astra')).toMatchObject({
++      offEffort: 'none',
++      capabilities: ['thinking', 'always_thinking'],
++    });
++  });
++
++  it('keeps the reason a request failed, such as a refused redirect', async () => {
++    vi.stubGlobal('fetch', () =>
++      Promise.reject(new TypeError('fetch failed', { cause: new Error('unexpected redirect') })),
++    );
++    const host = memoryHost(baseConfig());
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.failed[0]!.reason).toContain('fetch failed: unexpected redirect');
++  });
++
++  it('reports a failed config write instead of claiming a change', async () => {
++    stubFetch();
++    const host = memoryHost(baseConfig());
++    host.setConfig = async () => {
++      throw new Error('config.toml could not be read');
++    };
++
++    const result = await refreshProviderModels(host);
++
++    expect(result.changed).toEqual([]);
++    expect(result.failed).toEqual(
++      expect.arrayContaining([
++        { provider: 'closerouter', reason: expect.stringContaining('config.toml could not be read') },
++      ]),
++    );
++  });
++});
+-- 
+2.50.1 (Apple Git-155)
+

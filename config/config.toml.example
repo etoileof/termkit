@@ -1,0 +1,573 @@
+default_model = "closerouter/openai-gpt-6-astra"
+default_permission_mode = "auto"
+
+[providers.closerouter]
+type = "openai"
+base_url = "https://api.closerouter.dev/v1"
+api_key_env = "CLOSEROUTER_API_KEY"
+
+[providers.closerouter-anthropic]
+type = "anthropic"
+base_url = "https://api.closerouter.dev"
+api_key_env = "CLOSEROUTER_API_KEY"
+
+# CloseRouter limits and reasoning efforts are refreshed from CloseRouter
+# (GET /v1/models and /v1/models/{author}/{model}/endpoints) when Kimi starts
+# and every 6 hours while `kimi web` runs, for every alias whose endpoint is
+# CloseRouter; the values here are just the starting point. The refresh
+# rewrites max_context_size, max_output_size, support_efforts,
+# default_effort, off_effort and the thinking capabilities with what the
+# endpoint each alias is called through supports. To keep a value of your own
+# (such as a lower output cap), put it under [models."<alias>".overrides]:
+# overrides win and are never rewritten. Set model_source = "static" on a
+# provider to stop refreshing its models.
+
+[models."closerouter/openai-gpt-6-astra"]
+provider = "closerouter"
+model = "openai/gpt-6-astra"
+max_context_size = 786432
+max_output_size = 128000
+capabilities = ["thinking", "always_thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "high"
+
+[models."closerouter/openai-gpt-6-astra".overrides]
+max_output_size = 32000
+
+[models."closerouter/openai-gpt-6.1-sol"]
+provider = "closerouter"
+model = "openai/gpt-6.1-sol"
+max_context_size = 786432
+max_output_size = 128000
+capabilities = [ "thinking" ]
+support_efforts = [ "low", "medium", "high", "xhigh", "max" ]
+default_effort = "high"
+off_effort = "none"
+
+[models."closerouter/deepseek-v4-pro-0813"]
+provider = "closerouter"
+model = "deepseek/deepseek-v4-pro-0813"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["thinking", "always_thinking"]
+support_efforts = ["low", "high", "max"]
+default_effort = "high"
+
+[models."closerouter/glm-5.3"]
+provider = "closerouter"
+model = "z-ai/glm-5.3"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = [ "thinking", "always_thinking" ]
+support_efforts = [ "low", "high", "xhigh", "max" ]
+default_effort = "high"
+
+[models."closerouter/glm-5.3-flash"]
+provider = "closerouter"
+model = "z-ai/glm-5.3-flash"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = [ "thinking", "always_thinking" ]
+support_efforts = [ "low", "high", "xhigh", "max" ]
+default_effort = "high"
+
+[models."closerouter/gemini-4-argon"]
+provider = "closerouter"
+model = "google/gemini-4-argon"
+max_context_size = 128000
+max_output_size = 16384
+capabilities = [ "thinking", "always_thinking", "image_in" ]
+support_efforts = [ "minimal", "low", "medium", "high" ]
+default_effort = "high"
+
+[models."closerouter/grok-4.7"]
+provider = "closerouter"
+model = "x-ai/grok-4.7"
+max_context_size = 256000
+max_output_size = 32768
+capabilities = [ "thinking", "always_thinking", "image_in" ]
+support_efforts = [ "low", "medium", "high", "xhigh" ]
+default_effort = "high"
+
+[models."closerouter-anthropic/claude-fable-5.1"]
+provider = "closerouter-anthropic"
+model = "anthropic/claude-fable-5.1"
+max_context_size = 1000000
+max_output_size = 32000
+capabilities = [ "thinking" ]
+support_efforts = [ "low", "medium", "high", "xhigh", "max" ]
+default_effort = "high"
+
+[models."closerouter-anthropic/claude-fable-5"]
+provider = "closerouter-anthropic"
+model = "anthropic/claude-fable-5"
+max_context_size = 1000000
+max_output_size = 32000
+capabilities = [ "thinking" ]
+support_efforts = [ "low", "medium", "high", "xhigh", "max" ]
+default_effort = "high"
+
+[models."closerouter-anthropic/claude-opus-4.8"]
+provider = "closerouter-anthropic"
+model = "anthropic/claude-opus-4.8"
+max_context_size = 200000
+max_output_size = 32000
+capabilities = ["thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+default_effort = "high"
+
+[models."closerouter-anthropic/claude-opus-4.6"]
+provider = "closerouter-anthropic"
+model = "anthropic/claude-opus-4.6"
+max_context_size = 200000
+max_output_size = 32000
+capabilities = ["thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+default_effort = "high"
+
+[models."closerouter-anthropic/claude-opus-4.6".overrides]
+max_output_size = 31000
+
+[permission]
+dangerous_command_guard = false
+
+[thinking]
+enabled = false
+effort = "high"
+
+# CustomKIMI automatically reads the documented CloseRouter credits endpoint:
+# https://api.closerouter.dev/v1/credits
+# Set CLOSEROUTER_BALANCE_URL only for a compatible proxy endpoint.
+# Do not put API keys in this file; use CLOSEROUTER_API_KEY in the environment.
+# Optional cost rates are USD per million tokens:
+# CLOSEROUTER_INPUT_USD_PER_MILLION
+# CLOSEROUTER_OUTPUT_USD_PER_MILLION
+# CLOSEROUTER_CACHE_READ_USD_PER_MILLION
+# CLOSEROUTER_CACHE_WRITE_USD_PER_MILLION
+
+
+# 7api (https://7api.st), generated from docs/models.yml. The key is read from SEVENAPI_API_KEY.
+
+[providers.7api]
+type = "openai"
+base_url = "https://7api.st/v1"
+api_key_env = "SEVENAPI_API_KEY"
+
+[providers.7api-responses]
+type = "openai_responses"
+base_url = "https://7api.st/v1"
+api_key_env = "SEVENAPI_API_KEY"
+
+[providers.7api-anthropic]
+type = "anthropic"
+base_url = "https://7api.st"
+api_key_env = "SEVENAPI_API_KEY"
+
+[models."7api/gpt-6-astra"]
+provider = "7api-responses"
+model = "gpt-6-astra"
+display_name = "GPT-6 Astra (7api)"
+max_context_size = 1050000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-6.1-sol"]
+provider = "7api-responses"
+model = "gpt-6.1-sol"
+display_name = "GPT-6.1 Sol (7api)"
+max_context_size = 1050000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-6-sol"]
+provider = "7api-responses"
+model = "gpt-6-sol"
+display_name = "GPT-6 Sol (7api)"
+max_context_size = 1050000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-6-luna"]
+provider = "7api-responses"
+model = "gpt-6-luna"
+display_name = "GPT-6 Luna (7api)"
+max_context_size = 1050000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-5.6-sol"]
+provider = "7api-responses"
+model = "gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (7api)"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-5.6-terra"]
+provider = "7api-responses"
+model = "gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (7api)"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-5.6-luna"]
+provider = "7api-responses"
+model = "gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (7api)"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+
+[models."7api/gpt-5.5"]
+provider = "7api-responses"
+model = "gpt-5.5"
+display_name = "GPT-5.5 (7api)"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh"]
+off_effort = "none"
+
+[models."7api/claude-fable-5"]
+provider = "7api-anthropic"
+model = "claude-fable-5"
+display_name = "Claude Fable 5 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-sonnet-5"]
+provider = "7api-anthropic"
+model = "claude-sonnet-5"
+display_name = "Claude Sonnet 5 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-haiku-5-5"]
+provider = "7api-anthropic"
+model = "claude-haiku-5-5"
+display_name = "Claude Haiku 5.5 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-sonnet-5-5"]
+provider = "7api-anthropic"
+model = "claude-sonnet-5-5"
+display_name = "Claude Sonnet 5.5 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-opus-4-6"]
+provider = "7api-anthropic"
+model = "claude-opus-4-6"
+display_name = "Claude Opus 4.6 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-opus-4-7"]
+provider = "7api-anthropic"
+model = "claude-opus-4-7"
+display_name = "Claude Opus 4.7 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-opus-4-8"]
+provider = "7api-anthropic"
+model = "claude-opus-4-8"
+display_name = "Claude Opus 4.8 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-opus-5"]
+provider = "7api-anthropic"
+model = "claude-opus-5"
+display_name = "Claude Opus 5 (7api)"
+max_context_size = 1000000
+max_output_size = 64000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/claude-opus-5-5"]
+provider = "7api-anthropic"
+model = "claude-opus-5-5"
+display_name = "Claude Opus 5.5 (7api)"
+max_context_size = 1000000
+max_output_size = 128000
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+adaptive_thinking = true
+
+[models."7api/gemini-4-argon"]
+provider = "7api"
+model = "gemini-4-argon"
+display_name = "Gemini 4 Argon (7api)"
+max_context_size = 128000
+max_output_size = 16384
+capabilities = ["tool_use"]
+
+[models."7api/deepseek-v4-flash-0731"]
+provider = "7api"
+model = "deepseek-v4-flash-0731"
+display_name = "DeepSeek V4 Flash (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high"]
+off_effort = "none"
+
+[models."7api/deepseek-v4.1-flash"]
+provider = "7api"
+model = "deepseek-v4.1-flash"
+display_name = "DeepSeek V4.1 Flash (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high"]
+off_effort = "none"
+
+[models."7api/deepseek-v4-pro-0813"]
+provider = "7api"
+model = "deepseek-v4-pro-0813"
+display_name = "DeepSeek V4 Pro (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high"]
+off_effort = "none"
+
+[models."7api/deepseek-v4-pro-uncensored"]
+provider = "7api"
+model = "deepseek-v4-pro-uncensored"
+display_name = "DeepSeek V4 Pro Uncensored (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high"]
+off_effort = "none"
+
+[models."7api/mimo-v2.6-pro"]
+provider = "7api"
+model = "mimo-v2.6-pro"
+display_name = "MiMo V2.6 Pro (7api)"
+max_context_size = 600000
+max_output_size = 65536
+capabilities = ["tool_use"]
+
+[models."7api/mimo-v2.6-flash"]
+provider = "7api"
+model = "mimo-v2.6-flash"
+display_name = "MiMo V2.6 Flash (7api)"
+max_context_size = 600000
+max_output_size = 65536
+capabilities = ["tool_use"]
+
+[models."7api/kimi-k3"]
+provider = "7api"
+model = "kimi-k3"
+display_name = "Kimi K3 (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["low", "high", "max"]
+default_effort = "max"
+off_effort = "low"
+
+[models."7api/grok-4.7"]
+provider = "7api"
+model = "grok-4.7"
+display_name = "Grok 4.7 (7api)"
+max_context_size = 500000
+max_output_size = 65536
+capabilities = ["tool_use"]
+
+[models."7api/grok-4.6"]
+provider = "7api"
+model = "grok-4.6"
+display_name = "Grok 4.6 (7api)"
+max_context_size = 500000
+max_output_size = 65536
+capabilities = ["tool_use"]
+
+[models."7api/grok-4.5"]
+provider = "7api"
+model = "grok-4.5"
+display_name = "Grok 4.5 (7api)"
+max_context_size = 200000
+max_output_size = 64000
+capabilities = ["tool_use"]
+
+[models."7api/glm-5.2"]
+provider = "7api"
+model = "glm-5.2"
+display_name = "GLM-5.2 (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking"]
+support_efforts = ["low", "medium", "high", "xhigh", "max"]
+off_effort = "none"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3"]
+provider = "7api"
+model = "glm-5.3"
+display_name = "GLM-5.3 (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["low", "high", "xhigh", "max"]
+default_effort = "high"
+off_effort = "low"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3-uncensored"]
+provider = "7api"
+model = "glm-5.3-uncensored"
+display_name = "GLM-5.3 Uncensored (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["max"]
+default_effort = "max"
+off_effort = "max"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3-flash"]
+provider = "7api"
+model = "glm-5.3-flash"
+display_name = "GLM-5.3 Flash (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["low", "high", "xhigh", "max"]
+default_effort = "high"
+off_effort = "low"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3-flash-uncensored"]
+provider = "7api"
+model = "glm-5.3-flash-uncensored"
+display_name = "GLM-5.3 Flash Uncensored (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["max"]
+default_effort = "max"
+off_effort = "max"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3-abliterated"]
+provider = "7api"
+model = "glm-5.3-abliterated"
+display_name = "GLM-5.3 Abliterated (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["high", "xhigh", "max"]
+default_effort = "high"
+off_effort = "high"
+reasoning_key = "reasoning_content"
+
+[models."7api/glm-5.3-flash-abliterated"]
+provider = "7api"
+model = "glm-5.3-flash-abliterated"
+display_name = "GLM-5.3 Flash Abliterated (7api)"
+max_context_size = 1000000
+max_output_size = 65536
+capabilities = ["tool_use", "thinking", "always_thinking"]
+support_efforts = ["high", "xhigh", "max"]
+default_effort = "high"
+off_effort = "high"
+reasoning_key = "reasoning_content"
+
+# OpenRouter (https://openrouter.ai). The key is read from OPENROUTER_API_KEY; the
+# footer balance also uses the OPENROUTER_MANAGEMENT_KEY Keychain entry, which is
+# deliberately not exported into Kimi's environment. Limits and reasoning efforts
+# of OpenRouter aliases are refreshed from OpenRouter's public model list at start;
+# pin your own values under [models."<alias>".overrides].
+
+[providers.openrouter]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[models."openrouter/muse-wonder"]
+provider = "openrouter"
+model = "meta/muse-wonder"
+max_context_size = 1048576
+max_output_size = 943718
+capabilities = [ "thinking", "always_thinking", "image_in" ]
+support_efforts = [ "minimal", "low", "medium", "high", "xhigh", "max" ]
+default_effort = "high"
+
+[models."openrouter/qwen3.8-27b"]
+provider = "openrouter"
+model = "qwen/qwen3.8-27b"
+max_context_size = 65536
+max_output_size = 32768
+capabilities = [ "thinking" ]
+support_efforts = [ "low", "medium", "xhigh" ]
+default_effort = "xhigh"
+off_effort = "none"
+
+# The startup refresh writes Qwen's model-wide limits and picks "medium";
+# these keep Cerebras's limits and OpenRouter's default effort.
+[models."openrouter/qwen3.8-27b".overrides]
+max_context_size = 65536
+max_output_size = 32768
+default_effort = "xhigh"
+
+# Sent with every request: run only on Cerebras, never fall back (feature 11).
+[models."openrouter/qwen3.8-27b".extra_body.provider]
+only = [ "cerebras/fp16" ]
+allow_fallbacks = false
+
+# Kimi K3.1 Pro (Moonshot's 1M-context reasoning model) through OpenRouter.
+# Added 2026-10-24 from OpenRouter's model list: context 1,048,576, output
+# 943,718, reasoning efforts low/high/max (default max, "none" turns it off),
+# $2 / $10 per million tokens, cache reads $0.20. Image input supported.
+[models."openrouter/kimi-k3.1-pro"]
+provider = "openrouter"
+model = "moonshotai/kimi-k3.1-pro"
+display_name = "Kimi K3.1 Pro (OpenRouter)"
+max_context_size = 1048576
+max_output_size = 943718
+capabilities = [ "thinking", "image_in" ]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+off_effort = "none"

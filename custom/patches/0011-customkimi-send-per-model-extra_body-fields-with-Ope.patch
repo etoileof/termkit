@@ -1,0 +1,279 @@
+From 9a6a98f9505195d1dd1578dfc0c93fcb09e8aead Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Fri, 23 Oct 2026 08:33:56 +0200
+Subject: [PATCH 11/13] customkimi: send per-model extra_body fields with
+ OpenAI requests
+
+---
+ .../agent-core-v2/docs/config-manifest.toml   |  1 +
+ .../src/app/kosongConfig/configSection.ts     |  2 ++
+ .../bases/openai-responses/format.ts          |  1 +
+ .../llm/requester/bases/openai/format.ts      |  1 +
+ .../src/human/llm/requester/requester.ts      |  1 +
+ .../human/test/llm/response-format.test.ts    | 36 +++++++++++++++++++
+ .../src/llm-adapter/model/catalog-service.ts  |  2 ++
+ .../llm-adapter/model/model-requester-impl.ts |  1 +
+ .../src/llm-adapter/model/model.ts            |  1 +
+ .../src/llm-adapter/protocol/protocol.ts      |  1 +
+ .../test/app/model/model.test.ts              | 10 ++++++
+ .../test/llm-adapter/model/catalog.test.ts    | 23 ++++++++++++
+ .../llm-adapter/model/modelRequester.test.ts  | 13 +++++++
+ 13 files changed, 93 insertions(+)
+
+diff --git a/packages/agent-core-v2/docs/config-manifest.toml b/packages/agent-core-v2/docs/config-manifest.toml
+index a82cc33f3cf2e0613070ff3a7514a07c4f40e527..7ae6f7d121d0bcd0b50ae93c3f33c44ea3bb47f3 100644
+--- a/packages/agent-core-v2/docs/config-manifest.toml
++++ b/packages/agent-core-v2/docs/config-manifest.toml
+@@ -293,6 +293,7 @@ merge_all_available_skills = true
+     # model: string
+     # migration_markdown: string
+     # retirement_at: string
++  # extra_body: record<string, any>
+   # overrides: object
+     # max_context_size: integer
+     # max_input_size: integer
+diff --git a/packages/agent-core-v2/src/app/kosongConfig/configSection.ts b/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
+index 6dc7391156e453706ed5bb0d79af30f4e8db95e1..8d824c9beee141a5839a676b104bf253fb1fa791 100644
+--- a/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
++++ b/packages/agent-core-v2/src/app/kosongConfig/configSection.ts
+@@ -179,6 +179,7 @@ const ModelBaseSchema = z.object({
+   defaultEffort: z.string().optional(),
+   offEffort: z.string().optional(),
+   upgrade: modelUpgradeSchema.optional(),
++  extraBody: z.record(z.string(), z.unknown()).optional(),
+ });
+ 
+ export const ModelOverrideSchema = ModelBaseSchema.omit({
+@@ -193,6 +194,7 @@ export const ModelOverrideSchema = ModelBaseSchema.omit({
+   model: true,
+   betaApi: true,
+   upgrade: true,
++  extraBody: true,
+ }).partial();
+ 
+ export const ModelRecordSchema = ModelBaseSchema.extend({
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
+index 3b14b12d2d94a13ede7c8a6badaee91e767538d9..8c1a1c0360b29d0f51841a05703aa38ed5b166a6 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
+@@ -416,6 +416,7 @@ export function assembleOpenAIResponsesRequest(
+   parts: OpenAIResponsesRequestParts,
+ ): Record<string, unknown> {
+   return {
++    ...input.extraBody,
+     model: input.model.model,
+     instructions: input.systemPrompt ? input.systemPrompt : undefined,
+     input: parts.input,
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+index bb1e4a7eeccf4dc4a1306e2a57660aecc9a9bb01..eb7938027161b2a7b6523dd0f7e22bbac26c1d61 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+@@ -188,6 +188,7 @@ export function assembleOpenAIRequest(
+   parts: OpenAIRequestParts,
+ ): Record<string, unknown> {
+   return {
++    ...input.extraBody,
+     model: input.model.model,
+     messages: parts.messages,
+     tools: parts.tools.length === 0 ? undefined : parts.tools,
+diff --git a/packages/agent-core-v2/src/human/llm/requester/requester.ts b/packages/agent-core-v2/src/human/llm/requester/requester.ts
+index a416c76e34343b11b9784483c7f35cecee5fad4c..7a30c63849bb42666e25ed8655c68b1394dc300a 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/requester.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/requester.ts
+@@ -65,6 +65,7 @@ export interface LlmRequestConfig {
+   readonly maxCompletionTokens?: number;
+   readonly maxContextTokens?: number;
+   readonly extraParams?: ExtraParams;
++  readonly extraBody?: Readonly<Record<string, unknown>>;
+   readonly toolMessageConversion?: ToolMessageConversion;
+ }
+ 
+diff --git a/packages/agent-core-v2/src/human/test/llm/response-format.test.ts b/packages/agent-core-v2/src/human/test/llm/response-format.test.ts
+index 7fea582d590a1bc493933a31deb3de461aed500d..09b5434f2dfc73d2a4446fdcdeaf5d61ab8248fa 100644
+--- a/packages/agent-core-v2/src/human/test/llm/response-format.test.ts
++++ b/packages/agent-core-v2/src/human/test/llm/response-format.test.ts
+@@ -330,3 +330,39 @@ describe('requester toolMessageConversion', () => {
+     expect(JSON.stringify(inputItems)).not.toContain('input_image');
+   });
+ });
++
++describe('requester extraBody', () => {
++  const extraBody = {
++    provider: { only: ['cerebras/fp16'], allow_fallbacks: false },
++    model: 'overridden',
++    stream: false,
++  };
++
++  it('adds the extra fields at the top level of a chat completions request', async () => {
++    const client = stubOpenAIClient(chatCompletionChunks);
++    const requester = createOpenAIRequester({ clientFactory: client.clientFactory });
++    await requester.generate(
++      { model, extraBody, thinking: { effort: 'high' } },
++      { messages },
++      { signal: new AbortController().signal },
++    );
++    expect(client.body()['provider']).toEqual({ only: ['cerebras/fp16'], allow_fallbacks: false });
++    expect(client.body()['model']).toBe('test-model');
++    expect(client.body()['stream']).toBe(true);
++    expect(client.body()['reasoning_effort']).toBe('high');
++    expect(client.body()['extra_body']).toBeUndefined();
++  });
++
++  it('adds the extra fields at the top level of a responses request', async () => {
++    const client = stubResponsesClient(responsesStreamEvents);
++    const requester = createOpenAIResponsesRequester({ clientFactory: client.clientFactory });
++    await requester.generate(
++      { model, extraBody },
++      { messages },
++      { signal: new AbortController().signal },
++    );
++    expect(client.body()['provider']).toEqual({ only: ['cerebras/fp16'], allow_fallbacks: false });
++    expect(client.body()['model']).toBe('test-model');
++    expect(client.body()['stream']).toBe(true);
++  });
++});
+diff --git a/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts b/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
+index ac132ba3cdea2adc23067d2d3d52754f8b673c08..096cc3beeb53cbf65879940dff96fd9f81570f94 100644
+--- a/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
++++ b/packages/agent-core-v2/src/llm-adapter/model/catalog-service.ts
+@@ -564,6 +564,7 @@ function buildProtocolProviderOptions(
+       const reasoningKey = nonEmpty(model.reasoningKey);
+       if (reasoningKey !== undefined) options.reasoningKey = reasoningKey;
+       if (model.offEffort !== undefined) options.offEffort = model.offEffort;
++      if (model.extraBody !== undefined) options.extraBody = model.extraBody;
+       break;
+     }
+     case 'google-genai': {
+@@ -578,6 +579,7 @@ function buildProtocolProviderOptions(
+     }
+     case 'openai_responses':
+       if (model.offEffort !== undefined) options.offEffort = model.offEffort;
++      if (model.extraBody !== undefined) options.extraBody = model.extraBody;
+       break;
+     default: {
+       const exhaustive: never = protocol;
+diff --git a/packages/agent-core-v2/src/llm-adapter/model/model-requester-impl.ts b/packages/agent-core-v2/src/llm-adapter/model/model-requester-impl.ts
+index 83cc1cbde9c44724864b4f19a7ce73c96366673a..a5c2af801b61c00993a1354d35eaf0751c5dde94 100644
+--- a/packages/agent-core-v2/src/llm-adapter/model/model-requester-impl.ts
++++ b/packages/agent-core-v2/src/llm-adapter/model/model-requester-impl.ts
+@@ -169,6 +169,7 @@ export class ModelRequesterImpl implements ModelRequester {
+       maxCompletionTokens: params?.maxCompletionTokens,
+       maxContextTokens: params?.maxContextTokens,
+       extraParams: samplingExtraParams(resolved.protocol, params?.sampling),
++      extraBody: this.model.providerOptions?.extraBody,
+     };
+     const content: LlmRequestContent = {
+       messages: input.messages.map(toLlmMessage),
+diff --git a/packages/agent-core-v2/src/llm-adapter/model/model.ts b/packages/agent-core-v2/src/llm-adapter/model/model.ts
+index bd9c6303e05fac45dc914e0cbf3612f17d98fd6f..59ffd7f7ec3f1268cfeb1ade3132cb5dcd398063 100644
+--- a/packages/agent-core-v2/src/llm-adapter/model/model.ts
++++ b/packages/agent-core-v2/src/llm-adapter/model/model.ts
+@@ -52,6 +52,7 @@ export interface ModelRecord {
+   defaultEffort?: string;
+   offEffort?: string;
+   upgrade?: ModelUpgrade;
++  extraBody?: Record<string, unknown>;
+ 
+   overrides?: ModelOverride;
+ 
+diff --git a/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts b/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
+index 6378c4c976602b4afdb3e38b7360dc7997b98ef0..413dc09d6ce2a7a1c2c5d2726a7f494e58609668 100644
+--- a/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
++++ b/packages/agent-core-v2/src/llm-adapter/protocol/protocol.ts
+@@ -23,6 +23,7 @@ export interface ProtocolProviderOptions {
+   readonly vertexai?: boolean;
+   readonly project?: string;
+   readonly location?: string;
++  readonly extraBody?: Readonly<Record<string, unknown>>;
+ }
+ 
+ export interface ProtocolAdapterConfig {
+diff --git a/packages/agent-core-v2/test/app/model/model.test.ts b/packages/agent-core-v2/test/app/model/model.test.ts
+index f76c8a84128d61df5c8396424ac0f2b916d68613..08fcb30a924febfd5543c4cb214367020fa237e1 100644
+--- a/packages/agent-core-v2/test/app/model/model.test.ts
++++ b/packages/agent-core-v2/test/app/model/model.test.ts
+@@ -214,6 +214,16 @@ describe('models TOML transforms', () => {
+     });
+   });
+ 
++  it('keeps extra_body keys verbatim in both directions', () => {
++    const extraBody = { provider: { only: ['cerebras/fp16'], allow_fallbacks: false } };
++    expect(
++      modelsFromToml({ qwen: { provider: 'p', model: 'm', extra_body: extraBody } }),
++    ).toEqual({ qwen: { provider: 'p', model: 'm', extraBody } });
++    expect(
++      modelsToToml({ qwen: { provider: 'p', model: 'm', extraBody } }, {}),
++    ).toEqual({ qwen: { provider: 'p', model: 'm', extra_body: extraBody } });
++  });
++
+   it('snakeCases nested model overrides for TOML', () => {
+     expect(
+       modelsToToml(
+diff --git a/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts b/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
+index 313e78a15792698043527c94b2274af3d5234a8a..5fb56abf0cc93e88c22de4f286912d58420936fe 100644
+--- a/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
++++ b/packages/agent-core-v2/test/llm-adapter/model/catalog.test.ts
+@@ -358,6 +358,29 @@ describe('Model assembly (pure data)', () => {
+     }
+   });
+ 
++  it('passes a declared extraBody through providerOptions for the OpenAI wires only', () => {
++    const extraBody = { provider: { only: ['cerebras/fp16'], allow_fallbacks: false } };
++    const { host, catalog } = createHost({
++      providers: {
++        gateway: { type: 'openai', apiKey: 'sk-gw', baseUrl: 'https://gateway.example.test/v1' },
++        responses: { type: 'openai_responses', apiKey: 'sk-r' },
++        claude: { type: 'anthropic', apiKey: 'sk-a' },
++      },
++      models: {
++        chat: { provider: 'gateway', model: 'qwen', maxContextSize: 65536, extraBody },
++        resp: { provider: 'responses', model: 'qwen', maxContextSize: 65536, extraBody },
++        anth: { provider: 'claude', model: 'claude-x', maxContextSize: 1000, extraBody },
++      },
++    });
++    try {
++      expect(catalog.get('chat').providerOptions).toEqual({ extraBody });
++      expect(catalog.get('resp').providerOptions).toEqual({ extraBody });
++      expect(catalog.get('anth').providerOptions?.extraBody).toBeUndefined();
++    } finally {
++      host.dispose();
++    }
++  });
++
+   it('enables google-genai vertex mode through providerOptions when project and location resolve', () => {
+     const { host, catalog } = createHost({
+       providers: {
+diff --git a/packages/agent-core-v2/test/llm-adapter/model/modelRequester.test.ts b/packages/agent-core-v2/test/llm-adapter/model/modelRequester.test.ts
+index 1da93871f8dc587908a5dfdc0b9350f92a25c659..321ad6b8807689a328611371e040bb77eb5db9ea 100644
+--- a/packages/agent-core-v2/test/llm-adapter/model/modelRequester.test.ts
++++ b/packages/agent-core-v2/test/llm-adapter/model/modelRequester.test.ts
+@@ -197,6 +197,18 @@ describe('ModelRequesterImpl request execution', () => {
+     expect(call.control.signal).toBe(signal);
+   });
+ 
++  it('sends the model extraBody with every request', async () => {
++    const requester = new FakeLlmRequester();
++    requester.handler = (_i, emit) => textStream(emit);
++    const extraBody = { provider: { only: ['cerebras/fp16'], allow_fallbacks: false } };
++    const impl = new ModelRequesterImpl(
++      { ...modelWith(createStaticCredentialProvider()), providerOptions: { extraBody } },
++      gatewayReturning(requester),
++    );
++    await collect(impl.request(INPUT));
++    expect(requester.calls[0]?.config.extraBody).toEqual(extraBody);
++  });
++
+   it('omits the thinking intent when no effort is requested', async () => {
+     const requester = new FakeLlmRequester();
+     requester.handler = (_i, emit) => textStream(emit);
+@@ -207,6 +219,7 @@ describe('ModelRequesterImpl request execution', () => {
+     await collect(impl.request(INPUT));
+     expect(requester.calls[0]?.config.thinking).toBeUndefined();
+     expect(requester.calls[0]?.config.extraParams).toBeUndefined();
++    expect(requester.calls[0]?.config.extraBody).toBeUndefined();
+     expect(requester.calls[0]?.config.model.apiKey).toBeUndefined();
+   });
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,143 @@
+name: Windows release
+
+# Builds kimi.exe (Kimi Code native build + custom/patches) on Windows, tests the
+# double-click installer and publishes CustomKIMI-<version>-windows-x64.zip as a release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'custom/BASE_VERSION'
+      - 'custom/patches/**'
+      - 'config/config.toml.example'
+      - 'windows/**'
+      - '.github/scripts/test-windows-setup.ps1'
+      - '.github/workflows/windows-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep line endings as committed
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - name: Checkout CustomKIMI
+        uses: actions/checkout@v6
+        with:
+          path: customkimi
+
+      - name: Read base version
+        id: base
+        run: echo "version=$(tr -d '[:space:]' < customkimi/custom/BASE_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Kimi Code ${{ steps.base.outputs.version }}
+        run: git clone --depth 1 --branch "@moonshot-ai/kimi-code@${{ steps.base.outputs.version }}" https://github.com/MoonshotAI/kimi-code.git source
+
+      - name: Apply custom/patches
+        id: patches
+        working-directory: source
+        run: |
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git -c user.name=CustomKIMI -c user.email=customkimi@localhost am --3way ../customkimi/custom/patches/*.patch
+          git log --oneline -n "$(ls ../customkimi/custom/patches/*.patch | wc -l)"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: source/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: source/.nvmrc
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build kimi.exe
+        working-directory: source
+        env:
+          KIMI_AZURE_TRUSTED_SIGNING: 'false'
+        run: |
+          node apps/kimi-code/scripts/check-web-assets.mjs
+          pnpm --filter @moonshot-ai/kimi-code run build:native:sea
+
+      - name: Smoke test kimi.exe
+        working-directory: source
+        run: pnpm --filter @moonshot-ai/kimi-code run test:native:smoke
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.base.outputs.version }}'
+          $name = "termkit-$version-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'source/apps/kimi-code/dist-native/bin/win32-x64/kimi.exe' $stage
+          Copy-Item 'customkimi/windows/*' $stage
+          Copy-Item 'customkimi/config/config.toml.example' $stage
+          Copy-Item 'source/LICENSE' (Join-Path $stage 'LICENSE-upstream.txt')
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          [IO.File]::WriteAllText((Join-Path $stage 'version.txt'), "$version (build $env:GITHUB_RUN_NUMBER, $sha)")
+          $leaks = Get-ChildItem $stage -File | Where-Object Extension -ne '.exe' |
+            Select-String -Pattern 'closerouter_[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{40,}' -List
+          if ($leaks) { throw "Refusing to package: an API key was found in $($leaks.Path -join ', ')" }
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+          Get-ChildItem $stage | Format-Table Name, Length
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Test the installer (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unzipped = Join-Path $env:RUNNER_TEMP 'unzipped'
+          Expand-Archive -LiteralPath '${{ steps.package.outputs.zip }}' -DestinationPath $unzipped -Force
+          & .\customkimi\.github\scripts\test-windows-setup.ps1 -Package (Join-Path $unzipped '${{ steps.package.outputs.name }}') -Version '${{ steps.base.outputs.version }}'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+          retention-days: 14
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.base.outputs.version }}
+          NAME: ${{ steps.package.outputs.name }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          BASE: ${{ steps.patches.outputs.base }}
+        run: |
+          tag="v${VERSION}-build${GITHUB_RUN_NUMBER}"
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Base ${VERSION} with the patches:"
+            echo
+            git -C source log --reverse --format='- %s' "${BASE}..HEAD"
+            echo
+            echo "**Install on Windows:** download \`${NAME}.zip\`, extract it, double-click \`Install.cmd\`, paste the two keys (Enter skips either), then run \`kimi\` in a new terminal."
+          } > "$notes"
+          gh release create "$tag" "$ZIP" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "termkit ${VERSION} (build ${GITHUB_RUN_NUMBER})" --notes-file "$notes" --latest

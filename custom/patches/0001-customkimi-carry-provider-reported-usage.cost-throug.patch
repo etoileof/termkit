@@ -1,0 +1,399 @@
+From 6a2cdb2daee149922bac114fbeda525f489b142a Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Thu, 15 Oct 2026 13:21:46 +0200
+Subject: [PATCH 01/13] customkimi: carry provider-reported usage.cost through
+ usage totals
+
+CloseRouter returns the authoritative USD cost of each request in usage.cost. Parse it in the Anthropic, OpenAI chat and OpenAI Responses requesters, keep it when usage patches are merged, add it up in the session usage summary, and expose it on the SDK TokenUsage type. Regenerate docs/state-manifest.d.ts for the new field.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../agent-core-v2/docs/state-manifest.d.ts    |  1 +
+ .../llm/requester/bases/anthropic/contract.ts |  1 +
+ .../llm/requester/bases/anthropic/format.ts   |  5 ++-
+ .../bases/openai-responses/contract.ts        |  1 +
+ .../bases/openai-responses/format.ts          |  5 ++-
+ .../llm/requester/bases/openai/contract.ts    |  1 +
+ .../llm/requester/bases/openai/format.ts      |  4 +-
+ packages/agent-core-v2/src/human/llm/usage.ts | 11 +++++-
+ .../src/human/test/llm/usage.test.ts          | 39 ++++++++++++++++---
+ .../src/human/test/usage/machine.test.ts      | 20 +++++++---
+ .../agent-core-v2/src/human/usage/usage.ts    |  5 ++-
+ .../llm-adapter/contract/usage-tokens.test.ts | 11 ++++--
+ packages/node-sdk/src/types.ts                |  1 +
+ .../test/session-event-wiring.test.ts         |  2 +-
+ 14 files changed, 87 insertions(+), 20 deletions(-)
+
+diff --git a/packages/agent-core-v2/docs/state-manifest.d.ts b/packages/agent-core-v2/docs/state-manifest.d.ts
+index 4165769b2d9416b8ff32d81f3c7dab6517ae8631..ae9d10e0daa97e71fcfa7c36d19f913ffce6a969 100644
+--- a/packages/agent-core-v2/docs/state-manifest.d.ts
++++ b/packages/agent-core-v2/docs/state-manifest.d.ts
+@@ -949,6 +949,7 @@ export interface AgentStateSnapshot {
+       output: number;
+       inputCacheRead: number;
+       inputCacheCreation: number;
++      cost?: number;
+       raw?: Record<string, unknown>;
+     };
+     readonly llmTiming?: /* ContextMessageTiming — packages/agent-core-v2/src/agent/contextMemory/types.ts */ {
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/contract.ts b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/contract.ts
+index 8b0ea8718dbade240d90d4205d03d1a371b72bdb..cb48048dd19dec1af95b74ed9a59bdd4833fecf6 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/contract.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/contract.ts
+@@ -38,6 +38,7 @@ export type AnthropicWireMessage = {
+ };
+ 
+ export type AnthropicRawUsage = {
++  cost?: number | null;
+   input_tokens?: number | null;
+   output_tokens?: number | null;
+   cache_read_input_tokens?: number | null;
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
+index 7e3436619cb9a1b310fed16ca38ba33ba1b97361..49859c08b5c57482c4baee64c9867c8d966907ce 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/anthropic/format.ts
+@@ -96,7 +96,10 @@ function parseRawUsage(usage: AnthropicRawUsage | undefined): Partial<TokenUsage
+   if (usage === undefined) {
+     return undefined;
+   }
+-  const patch: Partial<TokenUsage> = { raw: usage as Record<string, unknown> };
++  const patch: Partial<TokenUsage> = {
++    raw: usage as Record<string, unknown>,
++    cost: typeof usage.cost === 'number' ? usage.cost : undefined,
++  };
+   if (typeof usage.input_tokens === 'number') {
+     patch.inputOther = usage.input_tokens;
+   }
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/contract.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/contract.ts
+index 412074dd5e45544949c4e7f27b92dde785231900..f092319b8995dc2f4e07bd126abfe664e0c06af4 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/contract.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/contract.ts
+@@ -18,6 +18,7 @@ export type ResponsesInputItem =
+ export type OpenAIResponsesRawChunk = Record<string, unknown>;
+ 
+ export type OpenAIResponsesRawUsage = {
++  cost?: number;
+   input_tokens?: number;
+   output_tokens?: number;
+   input_tokens_details?: { cached_tokens?: number } | null;
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
+index 6dfbac2e2b65db1b3e9685d09a9fe559c59ef827..3b14b12d2d94a13ede7c8a6badaee91e767538d9 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai-responses/format.ts
+@@ -366,13 +366,16 @@ export function parseOpenAIResponsesUsage(usage: RawObject | null | undefined):
+   const outputTokens = readNumberField(usage, 'output_tokens') ?? 0;
+   const details = readObjectField(usage, 'input_tokens_details');
+   const cached = details === undefined ? 0 : (readNumberField(details, 'cached_tokens') ?? 0);
+-  return {
++  const result: TokenUsage = {
+     inputOther: inputTokens - cached,
+     output: outputTokens,
+     inputCacheRead: cached,
+     inputCacheCreation: 0,
+     raw: usage,
+   };
++  const cost = readNumberField(usage, 'cost');
++  if (cost !== undefined) result.cost = cost;
++  return result;
+ }
+ 
+ function extractEventUsage(event: RawObject): RawObject | undefined {
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai/contract.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai/contract.ts
+index bbaa5d4475d73277437f18d6e47dfffa77a93858..c9f7012f4aaa06f8d821212774040d8e2b6def65 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai/contract.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai/contract.ts
+@@ -22,6 +22,7 @@ export type OpenAIWireMessage =
+   | { role: 'tool'; tool_call_id: string; content: string | OpenAIContentPart[] };
+ 
+ export type OpenAIRawUsage = {
++  cost?: number;
+   prompt_tokens?: number;
+   completion_tokens?: number;
+   cached_tokens?: number;
+diff --git a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+index d074e9c1fb310d78f3dd1f497f28bb4481e2ed75..32fa3679a286259fc5d19994ac8e1c704ba16581 100644
+--- a/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
++++ b/packages/agent-core-v2/src/human/llm/requester/bases/openai/format.ts
+@@ -128,13 +128,15 @@ export function parseOpenAIUsage(usage: OpenAIRawUsage | null | undefined): Toke
+   }
+   const promptTokens = usage.prompt_tokens ?? 0;
+   const cached = usage.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0;
+-  return {
++  const result: TokenUsage = {
+     inputOther: promptTokens - cached,
+     output: usage.completion_tokens ?? 0,
+     inputCacheRead: cached,
+     inputCacheCreation: 0,
+     raw: usage as Record<string, unknown>,
+   };
++  if (usage.cost !== undefined) result.cost = usage.cost;
++  return result;
+ }
+ 
+ export interface OpenAIRequestParams {
+diff --git a/packages/agent-core-v2/src/human/llm/usage.ts b/packages/agent-core-v2/src/human/llm/usage.ts
+index 0c89998a50a1905a3d1b1106ba4ab73cbdb67f7d..bd5bb8d955c9567132ada162eacd1425bc3ded83 100644
+--- a/packages/agent-core-v2/src/human/llm/usage.ts
++++ b/packages/agent-core-v2/src/human/llm/usage.ts
+@@ -3,6 +3,7 @@ export interface TokenUsage {
+   output: number;
+   inputCacheRead: number;
+   inputCacheCreation: number;
++  cost?: number;
+   raw?: Record<string, unknown>;
+ }
+ 
+@@ -19,22 +20,28 @@ export function grandTotal(usage: TokenUsage): number {
+ }
+ 
+ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+-  return {
++  const cost = a.cost === undefined && b.cost === undefined ? undefined : (a.cost ?? 0) + (b.cost ?? 0);
++  const result: TokenUsage = {
+     inputOther: a.inputOther + b.inputOther,
+     output: a.output + b.output,
+     inputCacheRead: a.inputCacheRead + b.inputCacheRead,
+     inputCacheCreation: a.inputCacheCreation + b.inputCacheCreation,
+   };
++  if (cost !== undefined) result.cost = cost;
++  return result;
+ }
+ 
+ export function mergeUsagePatch(
+   base: TokenUsage | undefined,
+   patch: Partial<TokenUsage>,
+ ): TokenUsage {
+-  return {
++  const result: TokenUsage = {
+     inputOther: patch.inputOther ?? base?.inputOther ?? 0,
+     output: patch.output ?? base?.output ?? 0,
+     inputCacheRead: patch.inputCacheRead ?? base?.inputCacheRead ?? 0,
+     inputCacheCreation: patch.inputCacheCreation ?? base?.inputCacheCreation ?? 0,
+   };
++  const cost = patch.cost ?? base?.cost;
++  if (cost !== undefined) result.cost = cost;
++  return result;
+ }
+diff --git a/packages/agent-core-v2/src/human/test/llm/usage.test.ts b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
+index 56b2f8ee59142a9958215a06429da5700ae40f52..5161d3f84c428b398d2b76d1badb0498c15ff4f2 100644
+--- a/packages/agent-core-v2/src/human/test/llm/usage.test.ts
++++ b/packages/agent-core-v2/src/human/test/llm/usage.test.ts
+@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
+ import type { StreamParseSink } from '#/llm/protocol/format';
+ import { anthropicFormat } from '#/llm/requester/bases/anthropic/format';
+ import { createOpenAIFormat } from '#/llm/requester/bases/openai/format';
++import { parseOpenAIResponsesUsage } from '#/llm/requester/bases/openai-responses/format';
+ import type { TokenUsage } from '#/llm/usage';
+ 
+ const openAIFormat = createOpenAIFormat();
+@@ -20,10 +21,10 @@ function createSink() {
+ describe('openAIFormat stream usage', () => {
+   it('emits usage from the usage chunk', () => {
+     const { sink, usages } = createSink();
+-    const raw = { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 };
++    const raw = { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150, cost: 0.42 };
+     openAIFormat.createStreamParser()({ choices: [], usage: raw }, sink);
+     expect(usages).toEqual([
+-      { inputOther: 120, output: 30, inputCacheRead: 0, inputCacheCreation: 0, raw },
++      { inputOther: 120, output: 30, inputCacheRead: 0, inputCacheCreation: 0, cost: 0.42, raw },
+     ]);
+   });
+ 
+@@ -34,10 +35,11 @@ describe('openAIFormat stream usage', () => {
+       completion_tokens: 50,
+       prompt_tokens_details: { cached_tokens: 80 },
+       completion_tokens_details: { reasoning_tokens: 12 },
++      cost: 1.25,
+     };
+     openAIFormat.createStreamParser()({ usage: raw }, sink);
+     expect(usages).toEqual([
+-      { inputOther: 120, output: 50, inputCacheRead: 80, inputCacheCreation: 0, raw },
++      { inputOther: 120, output: 50, inputCacheRead: 80, inputCacheCreation: 0, cost: 1.25, raw },
+     ]);
+   });
+ 
+@@ -50,6 +52,31 @@ describe('openAIFormat stream usage', () => {
+   });
+ });
+ 
++describe('openAI responses usage', () => {
++  it('parses authoritative cost', () => {
++    expect(
++      parseOpenAIResponsesUsage({
++        input_tokens: 100,
++        output_tokens: 20,
++        input_tokens_details: { cached_tokens: 30 },
++        cost: 0.9,
++      }),
++    ).toEqual({
++      inputOther: 70,
++      output: 20,
++      inputCacheRead: 30,
++      inputCacheCreation: 0,
++      cost: 0.9,
++      raw: {
++        input_tokens: 100,
++        output_tokens: 20,
++        input_tokens_details: { cached_tokens: 30 },
++        cost: 0.9,
++      },
++    });
++  });
++});
++
+ describe('anthropicFormat stream usage', () => {
+   it('emits message_start input usage and message_delta output usage as they arrive', () => {
+     const { sink, usages } = createSink();
+@@ -59,18 +86,20 @@ describe('anthropicFormat stream usage', () => {
+       output_tokens: 1,
+       cache_read_input_tokens: 300,
+       cache_creation_input_tokens: 100,
++      cost: 0.75,
+     };
+-    const deltaRaw = { output_tokens: 87 };
++    const deltaRaw = { output_tokens: 87, cost: 0.5 };
+     parse({ type: 'message_start', message: { usage: startRaw } }, sink);
+     parse({ type: 'message_delta', usage: deltaRaw }, sink);
+     expect(usages).toEqual([
+       {
+         inputOther: 500,
++        cost: 0.75,
+         inputCacheRead: 300,
+         inputCacheCreation: 100,
+         raw: startRaw,
+       },
+-      { output: 87, raw: deltaRaw },
++      { output: 87, cost: 0.5, raw: deltaRaw },
+     ]);
+   });
+ 
+diff --git a/packages/agent-core-v2/src/human/test/usage/machine.test.ts b/packages/agent-core-v2/src/human/test/usage/machine.test.ts
+index b9f20f40979a203d3dd37d15061c0d6732560f2b..fcef6eff05938b3d243a50782f1b4745d1fa5c6e 100644
+--- a/packages/agent-core-v2/src/human/test/usage/machine.test.ts
++++ b/packages/agent-core-v2/src/human/test/usage/machine.test.ts
+@@ -26,8 +26,10 @@ import {
+ 
+ const model: LlmModel = { provider: 'test', model: 'test-model', capability: UNKNOWN_CAPABILITY };
+ 
+-function usage(inputOther: number, output: number): TokenUsage {
+-  return { inputOther, output, inputCacheRead: 0, inputCacheCreation: 0 };
++function usage(inputOther: number, output: number, cost?: number): TokenUsage {
++  const result: TokenUsage = { inputOther, output, inputCacheRead: 0, inputCacheCreation: 0 };
++  if (cost !== undefined) result.cost = cost;
++  return result;
+ }
+ 
+ function record(
+@@ -95,22 +97,30 @@ describe('usage machine', () => {
+     actor.on('usage.updated', (event) => emitted.push(event));
+     actor.start();
+ 
+-    actor.send({ type: 'usage.record', record: record(10, 2, { model, turnId: 1 }) });
+-    actor.send({ type: 'usage.record', record: record(5, 3, { model, turnId: 1 }) });
++    actor.send({
++      type: 'usage.record',
++      record: { ...record(10, 2, { model, turnId: 1 }), usage: usage(10, 2, 0.25) },
++    });
++    actor.send({
++      type: 'usage.record',
++      record: { ...record(5, 3, { model, turnId: 1 }), usage: usage(5, 3, 0.5) },
++    });
+ 
+     expect(emitted).toHaveLength(2);
+-    expect(emitted[1]?.record.usage).toEqual(usage(5, 3));
++    expect(emitted[1]?.record.usage).toEqual(usage(5, 3, 0.5));
+     expect(emitted[1]?.summary.total).toEqual({
+       inputOther: 15,
+       output: 5,
+       inputCacheRead: 0,
+       inputCacheCreation: 0,
++      cost: 0.75,
+     });
+     expect(emitted[1]?.summary.byTurn[1]).toEqual({
+       inputOther: 15,
+       output: 5,
+       inputCacheRead: 0,
+       inputCacheCreation: 0,
++      cost: 0.75,
+     });
+   });
+ });
+diff --git a/packages/agent-core-v2/src/human/usage/usage.ts b/packages/agent-core-v2/src/human/usage/usage.ts
+index 5d894ce4e540e58dc5e09ae633e609fc4ee469dd..a0219aae6ac2d88e4f099d9791cb8aff132e8495 100644
+--- a/packages/agent-core-v2/src/human/usage/usage.ts
++++ b/packages/agent-core-v2/src/human/usage/usage.ts
+@@ -20,12 +20,15 @@ export function emptyUsageSummary(): UsageSummary {
+ 
+ function addUsage(base: TokenUsage | undefined, usage: Partial<TokenUsage>): TokenUsage {
+   const next = base ?? emptyUsage();
+-  return {
++  const result: TokenUsage = {
+     inputOther: next.inputOther + (usage.inputOther ?? 0),
+     output: next.output + (usage.output ?? 0),
+     inputCacheRead: next.inputCacheRead + (usage.inputCacheRead ?? 0),
+     inputCacheCreation: next.inputCacheCreation + (usage.inputCacheCreation ?? 0),
+   };
++  const cost = next.cost === undefined && usage.cost === undefined ? undefined : (next.cost ?? 0) + (usage.cost ?? 0);
++  if (cost !== undefined) result.cost = cost;
++  return result;
+ }
+ 
+ export function accumulateUsage(summary: UsageSummary, record: UsageRecord): UsageSummary {
+diff --git a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
+index d2ecabfb0988082d7dc2c193eeafbadfa88b1cb1..adb4300a81d6240d9edac6e246bc2274cb43841a 100644
+--- a/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
++++ b/packages/agent-core-v2/test/llm-adapter/contract/usage-tokens.test.ts
+@@ -21,17 +21,22 @@ describe('TokenUsage aggregation', () => {
+     });
+   });
+ 
+-  it('addUsage sums every counter', () => {
+-    const a = { inputOther: 1, output: 2, inputCacheRead: 3, inputCacheCreation: 4 };
+-    const b = { inputOther: 10, output: 20, inputCacheRead: 30, inputCacheCreation: 40 };
++  it('addUsage sums every counter and authoritative cost', () => {
++    const a = { inputOther: 1, output: 2, inputCacheRead: 3, inputCacheCreation: 4, cost: 0.5 };
++    const b = { inputOther: 10, output: 20, inputCacheRead: 30, inputCacheCreation: 40, cost: 1.25 };
+     expect(addUsage(a, b)).toEqual({
+       inputOther: 11,
+       output: 22,
+       inputCacheRead: 33,
+       inputCacheCreation: 44,
++      cost: 1.75,
+     });
+   });
+ 
++  it('does not invent a cost when neither usage has one', () => {
++    expect(addUsage(emptyUsage(), emptyUsage()).cost).toBeUndefined();
++  });
++
+   it('inputTotal sums all input counters, grandTotal adds output', () => {
+     const usage = { inputOther: 5, output: 7, inputCacheRead: 11, inputCacheCreation: 13 };
+     expect(inputTotal(usage)).toBe(29);
+diff --git a/packages/node-sdk/src/types.ts b/packages/node-sdk/src/types.ts
+index fe3772edee0c687f04326a885b42079c6b8f93de..5b06fae432409ec574990d027492444b217b8876 100644
+--- a/packages/node-sdk/src/types.ts
++++ b/packages/node-sdk/src/types.ts
+@@ -408,6 +408,7 @@ export interface TokenUsage {
+   readonly output: number;
+   readonly inputCacheRead: number;
+   readonly inputCacheCreation: number;
++  readonly cost?: number;
+ }
+ 
+ export interface SessionUsage {
+diff --git a/packages/node-sdk/test/session-event-wiring.test.ts b/packages/node-sdk/test/session-event-wiring.test.ts
+index 367064c0745032cc0beb58b0cc7fbfb52ec1bf78..34f8f2f3c9e98d4731733b4e138e20619784dbe6 100644
+--- a/packages/node-sdk/test/session-event-wiring.test.ts
++++ b/packages/node-sdk/test/session-event-wiring.test.ts
+@@ -98,7 +98,7 @@ function collectingSink(): { sink: SessionEventSink; events: Event[] } {
+ }
+ 
+ const USAGE = {
+-  total: { inputOther: 1, output: 2, inputCacheRead: 0, inputCacheCreation: 0 },
++  total: { inputOther: 1, output: 2, inputCacheRead: 0, inputCacheCreation: 0, cost: 0.25 },
+ };
+ 
+ function bindStatusServices(agent: FakeAgentHandle, model: string): void {
+-- 
+2.50.1 (Apple Git-155)
+

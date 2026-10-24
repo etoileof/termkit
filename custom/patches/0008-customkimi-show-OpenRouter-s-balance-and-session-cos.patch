@@ -1,0 +1,522 @@
+From 1572caa20942a111fc050792a0ceca7dc822bc58 Mon Sep 17 00:00:00 2001
+From: Administrator <administrator@Mac.lan>
+Date: Thu, 22 Oct 2026 16:04:19 +0200
+Subject: [PATCH 08/13] customkimi: show OpenRouter's balance and session cost
+ in the footer
+
+OpenRouter is the third billing provider. The balance comes from /credits with the management key (environment, else the macOS Keychain, never exported into Kimi's environment), else from the API key's limit_remaining; prices from the public model list cover replies without usage.cost. Tests blank the provider key variables so the footer never polls real balances.
+---
+ .../src/utils/billing/billing-provider.ts     |   8 +-
+ .../kimi-code/src/utils/billing/openrouter.ts | 137 +++++++++
+ apps/kimi-code/src/utils/billing/providers.ts |   7 +-
+ .../utils/billing/billing-providers.test.ts   | 273 +++++++++++++++++-
+ apps/kimi-code/vitest.config.ts               |   6 +
+ 5 files changed, 422 insertions(+), 9 deletions(-)
+ create mode 100644 apps/kimi-code/src/utils/billing/openrouter.ts
+
+diff --git a/apps/kimi-code/src/utils/billing/billing-provider.ts b/apps/kimi-code/src/utils/billing/billing-provider.ts
+index 1b3f7eca5577b98f1a4f3fbd3a6e39bc4fa7f73b..c1a0174bfc8cc04744047e2a7f8242b5e568d236 100644
+--- a/apps/kimi-code/src/utils/billing/billing-provider.ts
++++ b/apps/kimi-code/src/utils/billing/billing-provider.ts
+@@ -93,9 +93,11 @@ export abstract class BillingProvider {
+     return value === undefined || value === '' ? undefined : value;
+   }
+ 
+-  /** GETs a JSON document with the API key; resolves undefined on any failure. */
+-  protected async getJson(url: string): Promise<unknown> {
+-    const key = this.apiKey;
++  /**
++   * GETs a JSON document with the API key, or with `key` for endpoints that need another
++   * credential; resolves undefined without a key and on any failure.
++   */
++  protected async getJson(url: string, key: string | undefined = this.apiKey): Promise<unknown> {
+     if (key === undefined) return undefined;
+     try {
+       const response = await this.fetcher(url, {
+diff --git a/apps/kimi-code/src/utils/billing/openrouter.ts b/apps/kimi-code/src/utils/billing/openrouter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cec76bcbe8d4bf4a094c286f67574771790208a5
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/openrouter.ts
+@@ -0,0 +1,137 @@
++import { execFile } from 'node:child_process';
++import { userInfo } from 'node:os';
++
++import {
++  asRecord,
++  BillingProvider,
++  toFiniteNumber,
++  type BillingEnv,
++  type Fetcher,
++  type TokenPrices,
++} from './billing-provider';
++
++const API_BASE = 'https://openrouter.ai/api/v1';
++const MANAGEMENT_KEY_NAME = 'OPENROUTER_MANAGEMENT_KEY';
++const SECURITY_PATH = '/usr/bin/security';
++const KEYCHAIN_TIMEOUT_MS = 3_000;
++const MANAGEMENT_KEY_MISS_TTL_MS = 10 * 60_000;
++
++/** Looks up the stored management key; resolves undefined when there is none and never rejects. */
++export type ManagementKeyReader = () => Promise<string | undefined>;
++
++export interface OpenRouterBillingOptions {
++  readonly readManagementKey?: ManagementKeyReader;
++  readonly now?: () => number;
++}
++
++/**
++ * OpenRouter replies carry `usage.cost`, so its price list only covers replies without one.
++ *
++ * The account balance needs a management key, which can create and delete API keys. It is
++ * therefore deliberately kept out of Kimi's environment (and so out of the agent's shell):
++ * on macOS it is read from the login Keychain when the balance is polled, held only by this
++ * provider and sent only to /credits. OPENROUTER_MANAGEMENT_KEY in the environment wins, for
++ * systems without a Keychain. Without a management key the balance is the API key's
++ * remaining credit limit.
++ *
++ * The Keychain only keeps the key out of inherited environments. Any process running as the
++ * same user, the agent's shell included, can read the item with the same `security` command,
++ * so do not store a management key where the agent may run untrusted prompts.
++ */
++export class OpenRouterBilling extends BillingProvider {
++  readonly label = 'OpenRouter';
++  protected readonly host = 'openrouter.ai';
++  protected readonly apiKeyEnv = 'OPENROUTER_API_KEY';
++
++  private readonly readManagementKey: ManagementKeyReader;
++  private readonly now: () => number;
++  private storedManagementKey: string | undefined;
++  private managementKeyMissAt: number | undefined;
++
++  constructor(env?: BillingEnv, fetcher?: Fetcher, options: OpenRouterBillingOptions = {}) {
++    super(env, fetcher);
++    this.readManagementKey = options.readManagementKey ?? readKeychainManagementKey;
++    this.now = options.now ?? Date.now;
++  }
++
++  async fetchBalanceUsd(): Promise<number | undefined> {
++    if (!this.configured) return undefined;
++    const managementKey = await this.managementKey();
++    if (managementKey !== undefined) {
++      const body = await this.getJson(`${API_BASE}/credits`, managementKey);
++      const credits = asRecord(asRecord(body)?.['data']);
++      const total = toFiniteNumber(credits?.['total_credits']);
++      const usage = toFiniteNumber(credits?.['total_usage']);
++      if (total !== undefined && usage !== undefined) return total - usage;
++    }
++    // A key without a credit limit reports null: the balance is then unknown, not $0.
++    const key = asRecord(asRecord(await this.getJson(`${API_BASE}/key`))?.['data']);
++    return toFiniteNumber(key?.['limit_remaining']);
++  }
++
++  override async fetchPrices(): Promise<ReadonlyMap<string, TokenPrices>> {
++    const models = asRecord(await this.getJson(`${API_BASE}/models`))?.['data'];
++    const prices = new Map<string, TokenPrices>();
++    for (const model of Array.isArray(models) ? models : []) {
++      const entry = asRecord(model);
++      const pricing = asRecord(entry?.['pricing']);
++      const id = entry?.['id'];
++      const input = perMillion(pricing?.['prompt']);
++      const output = perMillion(pricing?.['completion']);
++      if (typeof id !== 'string' || input === undefined || output === undefined) continue;
++      prices.set(id, {
++        input,
++        output,
++        cacheRead: perMillion(pricing?.['input_cache_read']) ?? input,
++        cacheWrite: perMillion(pricing?.['input_cache_write']) ?? input,
++      });
++    }
++    return prices;
++  }
++
++  /**
++   * The environment's management key, else the stored one. A stored key is kept for the
++   * provider's lifetime; a miss is remembered for ten minutes, so the balance poll does not
++   * start a process every minute.
++   */
++  private async managementKey(): Promise<string | undefined> {
++    const fromEnv = this.envValue(MANAGEMENT_KEY_NAME);
++    if (fromEnv !== undefined) return fromEnv;
++    if (this.storedManagementKey !== undefined) return this.storedManagementKey;
++    const missAt = this.managementKeyMissAt;
++    if (missAt !== undefined && this.now() - missAt < MANAGEMENT_KEY_MISS_TTL_MS) return undefined;
++    this.storedManagementKey = await this.readManagementKey();
++    this.managementKeyMissAt = this.storedManagementKey === undefined ? this.now() : undefined;
++    return this.storedManagementKey;
++  }
++}
++
++/** USD per million tokens from a per-token price; "-1" (variable) or invalid is unknown. */
++function perMillion(value: unknown): number | undefined {
++  const perToken = toFiniteNumber(value);
++  return perToken !== undefined && perToken >= 0 ? perToken * 1_000_000 : undefined;
++}
++
++/**
++ * The management key from the macOS login Keychain (generic password, service
++ * OPENROUTER_MANAGEMENT_KEY, account = the current user). `security` is called by its
++ * absolute path, so nothing is resolved from PATH or the workspace.
++ */
++export function readKeychainManagementKey(): Promise<string | undefined> {
++  if (process.platform !== 'darwin') return Promise.resolve(undefined);
++  return new Promise((resolve) => {
++    try {
++      execFile(
++        SECURITY_PATH,
++        ['find-generic-password', '-a', userInfo().username, '-s', MANAGEMENT_KEY_NAME, '-w'],
++        { timeout: KEYCHAIN_TIMEOUT_MS },
++        (error, stdout) => {
++          const key = error === null ? stdout.trim() : '';
++          resolve(key === '' ? undefined : key);
++        },
++      );
++    } catch {
++      resolve(undefined);
++    }
++  });
++}
+diff --git a/apps/kimi-code/src/utils/billing/providers.ts b/apps/kimi-code/src/utils/billing/providers.ts
+index 91c1d1c8d68de5342b8020f7132442aaf06a7c41..3423c122ba0f7c7627d23cb20b98917d7223bc7e 100644
+--- a/apps/kimi-code/src/utils/billing/providers.ts
++++ b/apps/kimi-code/src/utils/billing/providers.ts
+@@ -1,8 +1,13 @@
+ import type { BillingEnv, BillingProvider, Fetcher } from './billing-provider';
+ import { ClosedRouterBilling } from './closedrouter';
++import { OpenRouterBilling } from './openrouter';
+ import { SevenApiBilling } from './sevenapi';
+ 
+ /** Every provider whose balance and costs the footer can show. Register new providers here. */
+ export function createBillingProviders(env?: BillingEnv, fetcher?: Fetcher): BillingProvider[] {
+-  return [new ClosedRouterBilling(env, fetcher), new SevenApiBilling(env, fetcher)];
++  return [
++    new ClosedRouterBilling(env, fetcher),
++    new SevenApiBilling(env, fetcher),
++    new OpenRouterBilling(env, fetcher),
++  ];
+ }
+diff --git a/apps/kimi-code/test/utils/billing/billing-providers.test.ts b/apps/kimi-code/test/utils/billing/billing-providers.test.ts
+index ae32d190517f2cdff9ecc6df34f883c3a818f309..896035c3091ceb5930721d3d6d82bd5495a8917a 100644
+--- a/apps/kimi-code/test/utils/billing/billing-providers.test.ts
++++ b/apps/kimi-code/test/utils/billing/billing-providers.test.ts
+@@ -1,28 +1,42 @@
+-import { describe, expect, it } from 'vitest';
++import { execFile } from 'node:child_process';
++import { userInfo } from 'node:os';
++
++import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+ import { costOfUsage } from '#/utils/billing/billing-provider';
+ import { ClosedRouterBilling } from '#/utils/billing/closedrouter';
++import { OpenRouterBilling, readKeychainManagementKey } from '#/utils/billing/openrouter';
+ import { createBillingProviders } from '#/utils/billing/providers';
+ import { SevenApiBilling } from '#/utils/billing/sevenapi';
+ 
++vi.mock('node:child_process', () => ({ execFile: vi.fn() }));
++
+ interface Call {
+   url: string;
+   authorization: string | null;
+ }
+ 
+-function fakeFetch(body: unknown, status = 200) {
++function routedFetch(reply: (url: string) => Response) {
+   const calls: Call[] = [];
+   const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+     calls.push({ url, authorization: new Headers(init?.headers).get('authorization') });
+-    return new Response(JSON.stringify(body), { status });
++    return reply(url);
+   };
+   return { fetcher, calls };
+ }
+ 
++function fakeFetch(body: unknown, status = 200) {
++  return routedFetch(() => new Response(JSON.stringify(body), { status }));
++}
++
+ describe('createBillingProviders', () => {
+-  it('registers ClosedRouter and 7api', () => {
+-    expect(createBillingProviders({}).map((provider) => provider.label)).toEqual(['ClosedRouter', '7api']);
++  it('registers ClosedRouter, 7api and OpenRouter', () => {
++    expect(createBillingProviders({}).map((provider) => provider.label)).toEqual([
++      'ClosedRouter',
++      '7api',
++      'OpenRouter',
++    ]);
+   });
+ });
+ 
+@@ -135,3 +149,252 @@ describe('SevenApiBilling', () => {
+     expect(billing.bills('https://api.closerouter.dev/v1')).toBe(false);
+   });
+ });
++
++describe('OpenRouterBilling', () => {
++  const API = 'https://openrouter.ai/api/v1';
++  const env = { OPENROUTER_API_KEY: 'sk-or-test' };
++  const managed = { ...env, OPENROUTER_MANAGEMENT_KEY: 'mgmt-env' };
++  const noStoredKey = async (): Promise<string | undefined> => undefined;
++  const credits = { data: { total_credits: 25, total_usage: 7.5 } };
++  const key = { data: { label: 'sk-or-v1-abc', usage: 3, limit_remaining: 4.25 } };
++
++  interface Reply {
++    readonly body: unknown;
++    readonly status: number;
++  }
++
++  function openRouterFetch(routes: Readonly<Record<string, Reply | Error>>) {
++    return routedFetch((url) => {
++      const route = routes[url] ?? { body: {}, status: 404 };
++      if (route instanceof Error) throw route;
++      return new Response(JSON.stringify(route.body), { status: route.status });
++    });
++  }
++
++  function json(body: unknown, status = 200): Reply {
++    return { body, status };
++  }
++
++  afterEach(() => {
++    vi.resetAllMocks();
++    vi.restoreAllMocks();
++  });
++
++  it('reads the balance from /credits with the management key from the environment', async () => {
++    const { fetcher, calls } = openRouterFetch({ [`${API}/credits`]: json(credits) });
++    const readManagementKey = vi.fn(async () => 'mgmt-keychain');
++    const padded = { ...env, OPENROUTER_MANAGEMENT_KEY: ' mgmt-env ' };
++    const billing = new OpenRouterBilling(padded, fetcher, { readManagementKey });
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(17.5);
++    expect(calls).toEqual([{ url: `${API}/credits`, authorization: 'Bearer mgmt-env' }]);
++    expect(readManagementKey).not.toHaveBeenCalled();
++  });
++
++  it('reads the management key from the Keychain when the environment has none, once for good', async () => {
++    const { fetcher, calls } = openRouterFetch({ [`${API}/credits`]: json(credits) });
++    const readManagementKey = vi.fn(async () => 'mgmt-keychain');
++    let now = 1_000_000;
++    const billing = new OpenRouterBilling({ ...env, OPENROUTER_MANAGEMENT_KEY: '  ' }, fetcher, {
++      readManagementKey,
++      now: () => now,
++    });
++    expect(readManagementKey).not.toHaveBeenCalled();
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(17.5);
++    now += 11 * 60_000;
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(17.5);
++    expect(readManagementKey).toHaveBeenCalledTimes(1);
++    expect(calls).toEqual([
++      { url: `${API}/credits`, authorization: 'Bearer mgmt-keychain' },
++      { url: `${API}/credits`, authorization: 'Bearer mgmt-keychain' },
++    ]);
++  });
++
++  it('remembers a missing management key for ten minutes and uses /key meanwhile', async () => {
++    const { fetcher, calls } = openRouterFetch({ [`${API}/key`]: json(key) });
++    const readManagementKey = vi.fn(noStoredKey);
++    let now = 1_000_000;
++    const billing = new OpenRouterBilling(env, fetcher, { readManagementKey, now: () => now });
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(4.25);
++    now += 60_000;
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(4.25);
++    expect(readManagementKey).toHaveBeenCalledTimes(1);
++    now += 9 * 60_000;
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(4.25);
++    expect(readManagementKey).toHaveBeenCalledTimes(2);
++    expect(calls).toHaveLength(3);
++    for (const call of calls) {
++      expect(call).toEqual({ url: `${API}/key`, authorization: 'Bearer sk-or-test' });
++    }
++  });
++
++  it.each([
++    ['an HTTP error', json({ error: { message: 'Forbidden' } }, 403)],
++    ['a failed request', new Error('offline')],
++    ['a body without usage', json({ data: { total_credits: 25 } })],
++    ['a non-numeric balance', json({ data: { total_credits: 'lots', total_usage: 1 } })],
++  ])('falls back to the key limit when /credits returns %s', async (_name, creditsReply) => {
++    const { fetcher, calls } = openRouterFetch({
++      [`${API}/credits`]: creditsReply,
++      [`${API}/key`]: json(key),
++    });
++    await expect(new OpenRouterBilling(managed, fetcher).fetchBalanceUsd()).resolves.toBe(4.25);
++    expect(calls).toEqual([
++      { url: `${API}/credits`, authorization: 'Bearer mgmt-env' },
++      { url: `${API}/key`, authorization: 'Bearer sk-or-test' },
++    ]);
++  });
++
++  it('reports a genuine zero balance', async () => {
++    const spent = json({ data: { total_credits: 5, total_usage: 5 } });
++    const { fetcher } = openRouterFetch({ [`${API}/credits`]: spent });
++    await expect(new OpenRouterBilling(managed, fetcher).fetchBalanceUsd()).resolves.toBe(0);
++  });
++
++  it('reports no balance for a key without a credit limit or when /key fails', async () => {
++    const options = { readManagementKey: noStoredKey };
++    const noLimit = json({ data: { usage: 3, limit_remaining: null } });
++    const unlimited = openRouterFetch({ [`${API}/key`]: noLimit });
++    await expect(
++      new OpenRouterBilling(env, unlimited.fetcher, options).fetchBalanceUsd(),
++    ).resolves.toBeUndefined();
++    const failing = openRouterFetch({ [`${API}/key`]: json({}, 500) });
++    await expect(
++      new OpenRouterBilling(env, failing.fetcher, options).fetchBalanceUsd(),
++    ).resolves.toBeUndefined();
++  });
++
++  it('is not configured and reads nothing without an API key', async () => {
++    const { fetcher, calls } = openRouterFetch({ [`${API}/credits`]: json(credits) });
++    const readManagementKey = vi.fn(async () => 'mgmt-keychain');
++    const billing = new OpenRouterBilling({ OPENROUTER_MANAGEMENT_KEY: 'mgmt-env' }, fetcher, {
++      readManagementKey,
++    });
++    expect(billing.configured).toBe(false);
++    expect(new OpenRouterBilling(env).configured).toBe(true);
++    await expect(billing.fetchBalanceUsd()).resolves.toBeUndefined();
++    await expect(billing.fetchPrices()).resolves.toEqual(new Map());
++    expect(calls).toHaveLength(0);
++    expect(readManagementKey).not.toHaveBeenCalled();
++  });
++
++  it('sends the management key only to /credits and the API key everywhere else', async () => {
++    const { fetcher, calls } = openRouterFetch({
++      [`${API}/credits`]: json({}, 500),
++      [`${API}/key`]: json(key),
++      [`${API}/models`]: json({ data: [] }),
++    });
++    const readManagementKey = async (): Promise<string> => 'mgmt-keychain';
++    const billing = new OpenRouterBilling(env, fetcher, { readManagementKey });
++    await billing.fetchBalanceUsd();
++    await billing.fetchPrices();
++    expect(calls).toEqual([
++      { url: `${API}/credits`, authorization: 'Bearer mgmt-keychain' },
++      { url: `${API}/key`, authorization: 'Bearer sk-or-test' },
++      { url: `${API}/models`, authorization: 'Bearer sk-or-test' },
++    ]);
++  });
++
++  it('turns the per-token catalog pricing into per-million prices', async () => {
++    const { fetcher, calls } = openRouterFetch({
++      [`${API}/models`]: json({
++        data: [
++          {
++            id: 'meta/muse-wonder',
++            context_length: 1048576,
++            pricing: { prompt: '0.000004', completion: '0.00002' },
++            reasoning: { mandatory: true, supported_efforts: ['high'], default_effort: 'medium' },
++          },
++          {
++            id: 'vendor/cached',
++            pricing: {
++              prompt: '0.0000025',
++              completion: '0.00001',
++              input_cache_read: '0.0000003',
++              input_cache_write: '0.00000375',
++            },
++          },
++          {
++            id: 'vendor/odd-cache',
++            pricing: {
++              prompt: '0.000001',
++              completion: '0.000002',
++              input_cache_read: '-1',
++              input_cache_write: 'n/a',
++            },
++          },
++          { id: 'vendor/free', pricing: { prompt: '0', completion: '0' } },
++          { id: 'openrouter/auto', pricing: { prompt: '-1', completion: '-1' } },
++          { id: 'vendor/bad-output', pricing: { prompt: '0.000001', completion: 'abc' } },
++          { id: 'vendor/no-output', pricing: { prompt: '0.000001' } },
++          { id: 'vendor/unpriced' },
++          { pricing: { prompt: '0.000001', completion: '0.000001' } },
++        ],
++      }),
++    });
++    const prices = await new OpenRouterBilling(env, fetcher).fetchPrices();
++    expect(calls).toEqual([{ url: `${API}/models`, authorization: 'Bearer sk-or-test' }]);
++    expect([...prices]).toEqual([
++      ['meta/muse-wonder', { input: 4, output: 20, cacheRead: 4, cacheWrite: 4 }],
++      ['vendor/cached', { input: 2.5, output: 10, cacheRead: 0.3, cacheWrite: 3.75 }],
++      ['vendor/odd-cache', { input: 1, output: 2, cacheRead: 1, cacheWrite: 1 }],
++      ['vendor/free', { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
++    ]);
++  });
++
++  it('returns no prices when the catalog cannot be read', async () => {
++    const { fetcher } = openRouterFetch({ [`${API}/models`]: json({ error: 'down' }, 503) });
++    await expect(new OpenRouterBilling(env, fetcher).fetchPrices()).resolves.toEqual(new Map());
++  });
++
++  it('bills only models served from openrouter.ai', () => {
++    const billing = new OpenRouterBilling(env);
++    expect(billing.bills('https://openrouter.ai/api/v1')).toBe(true);
++    expect(billing.bills('https://openrouter.ai/api/v1/')).toBe(true);
++    expect(billing.bills('https://api.closerouter.dev/v1')).toBe(false);
++    expect(billing.bills('https://7api.st/v1')).toBe(false);
++    expect(billing.bills('https://openrouter.ai.example.test/api/v1')).toBe(false);
++    expect(billing.bills(undefined)).toBe(false);
++  });
++});
++
++describe('readKeychainManagementKey', () => {
++  type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
++
++  afterEach(() => {
++    vi.resetAllMocks();
++    vi.restoreAllMocks();
++  });
++
++  function replyWith(error: Error | null, stdout: string): void {
++    vi.mocked(execFile).mockImplementation(((...args: unknown[]) => {
++      (args[3] as ExecFileCallback)(error, stdout, '');
++      return undefined as never;
++    }) as never);
++  }
++
++  it('reads the login Keychain through the absolute security path with a timeout', async () => {
++    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
++    replyWith(null, '  mgmt-keychain\n');
++    await expect(readKeychainManagementKey()).resolves.toBe('mgmt-keychain');
++    expect(execFile).toHaveBeenCalledWith(
++      '/usr/bin/security',
++      ['find-generic-password', '-a', userInfo().username, '-s', 'OPENROUTER_MANAGEMENT_KEY', '-w'],
++      { timeout: 3000 },
++      expect.any(Function),
++    );
++  });
++
++  it('resolves undefined when the item is missing or empty', async () => {
++    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
++    replyWith(new Error('The specified item could not be found in the keychain.'), '');
++    await expect(readKeychainManagementKey()).resolves.toBeUndefined();
++    replyWith(null, '\n');
++    await expect(readKeychainManagementKey()).resolves.toBeUndefined();
++  });
++
++  it('never spawns anything outside macOS', async () => {
++    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
++    await expect(readKeychainManagementKey()).resolves.toBeUndefined();
++    expect(execFile).not.toHaveBeenCalled();
++  });
++});
+diff --git a/apps/kimi-code/vitest.config.ts b/apps/kimi-code/vitest.config.ts
+index 350417bc28728283bdffcd0e4af48c87b50c6237..47603b80c7b0ec4d227fc158fa774b4cf9219751 100644
+--- a/apps/kimi-code/vitest.config.ts
++++ b/apps/kimi-code/vitest.config.ts
+@@ -14,6 +14,12 @@ export default defineConfig({
+     name: 'cli',
+     env: {
+       KIMI_LOG_LEVEL: 'off',
++      // Tests run inside a `kimi` shell inherit the wrapper's provider keys; blank them so
++      // the footer's default billing monitor never polls real balances or reads the Keychain.
++      CLOSEROUTER_API_KEY: '',
++      SEVENAPI_API_KEY: '',
++      OPENROUTER_API_KEY: '',
++      OPENROUTER_MANAGEMENT_KEY: '',
+     },
+     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
+   },
+-- 
+2.50.1 (Apple Git-155)
+

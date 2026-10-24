@@ -1,0 +1,1079 @@
+From 2742f17b753b211a2c86caa7ff004cd0edfc1c85 Mon Sep 17 00:00:00 2001
+From: CustomKIMI <customkimi@localhost>
+Date: Thu, 15 Oct 2026 13:21:47 +0200
+Subject: [PATCH 02/13] customkimi: show the active provider's balance and
+ session cost in the footer
+
+Show the account balance of the provider that serves the active model (ClosedRouter or 7api) next to context usage, plus the cost of the current session. Providers are BillingProvider subclasses in utils/billing (ClosedRouterBilling, SevenApiBilling), registered in providers.ts. BillingMonitor polls balances every 60 seconds and price lists every 10 minutes. Session cost adds the usage.cost that ClosedRouter reports and prices the remaining models from their provider's published per-model prices (7api /v1/models); it is hidden when any model cannot be priced. The optional CLOSEROUTER_*_USD_PER_MILLION rates still price ClosedRouter requests without a cost. Also fills a usage slot for status_line templates.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/tui/components/chrome/footer.ts       |  72 +++++--
+ .../tui/controllers/session-event-handler.ts  |   1 +
+ apps/kimi-code/src/tui/kimi-tui.ts            |   7 +
+ apps/kimi-code/src/tui/types.ts               |   3 +
+ .../src/utils/billing/billing-monitor.ts      | 145 +++++++++++++++
+ .../src/utils/billing/billing-provider.ts     | 110 +++++++++++
+ .../src/utils/billing/closedrouter.ts         |  43 +++++
+ apps/kimi-code/src/utils/billing/providers.ts |   8 +
+ apps/kimi-code/src/utils/billing/sevenapi.ts  |  30 +++
+ .../test/tui/components/chrome/footer.test.ts | 100 ++++++++++
+ .../session-event-handler-compaction.test.ts  |  14 ++
+ .../utils/billing/billing-monitor.test.ts     | 176 ++++++++++++++++++
+ .../utils/billing/billing-providers.test.ts   | 137 ++++++++++++++
+ 13 files changed, 835 insertions(+), 11 deletions(-)
+ create mode 100644 apps/kimi-code/src/utils/billing/billing-monitor.ts
+ create mode 100644 apps/kimi-code/src/utils/billing/billing-provider.ts
+ create mode 100644 apps/kimi-code/src/utils/billing/closedrouter.ts
+ create mode 100644 apps/kimi-code/src/utils/billing/providers.ts
+ create mode 100644 apps/kimi-code/src/utils/billing/sevenapi.ts
+ create mode 100644 apps/kimi-code/test/utils/billing/billing-monitor.test.ts
+ create mode 100644 apps/kimi-code/test/utils/billing/billing-providers.test.ts
+
+diff --git a/apps/kimi-code/src/tui/components/chrome/footer.ts b/apps/kimi-code/src/tui/components/chrome/footer.ts
+index d9fd3868f33618704b7428ecdb03d8be47e34c0f..645a3d8d16cf532673dbc4df5520dcb2359939a1 100644
+--- a/apps/kimi-code/src/tui/components/chrome/footer.ts
++++ b/apps/kimi-code/src/tui/components/chrome/footer.ts
+@@ -28,6 +28,13 @@ import {
+   type GitStatus,
+   type GitStatusCache,
+ } from '#/utils/git/git-status';
++import {
++  BillingMonitor,
++  modelResolver,
++  type BillingSource,
++  type ProviderBalance,
++} from '#/utils/billing/billing-monitor';
++import { createBillingProviders } from '#/utils/billing/providers';
+ import {
+   formatTokenCount,
+   usagePercent,
+@@ -213,8 +220,13 @@ export class FooterComponent implements Component {
+    */
+   private backgroundBashTaskCount = 0;
+   private backgroundAgentCount = 0;
++  private readonly billing: BillingSource;
+ 
+-  constructor(state: AppState, onRefresh: () => void = () => {}) {
++  constructor(
++    state: AppState,
++    onRefresh: () => void = () => {},
++    billing: BillingSource = new BillingMonitor(createBillingProviders(), { onUpdate: onRefresh }),
++  ) {
+     this.state = state;
+     this.onRefresh = onRefresh;
+     this.gitCacheWorkDir = state.workDir;
+@@ -224,6 +236,8 @@ export class FooterComponent implements Component {
+     this.syncGoalClock(state.goal);
+     this.syncGoalTimer(state.goal);
+     this.syncStatusLineRunner(state);
++    this.billing = billing;
++    this.billing.start();
+   }
+ 
+   setState(state: AppState): void {
+@@ -368,35 +382,48 @@ export class FooterComponent implements Component {
+       }
+     }
+ 
+-    // ── Line 2: hint (bottom-left) + context (right) ──
++    // ── Line 2: hint (bottom-left) + billing/context (right) ──
+     const contextText = formatContextStatus(
+       state.contextUsage,
+       state.contextTokens,
+       state.maxContextTokens,
+     );
+-    const contextWidth = visibleWidth(contextText);
++    const { balance, sessionCostUsd } = this.billingStatus(state);
++    const billing: string[] = [];
++    if (balance !== undefined) {
++      billing.push(chalk.hex(colors.primary)(`${balance.label} balance $${balance.usd.toFixed(2)}`));
++    }
++    if (sessionCostUsd !== undefined) {
++      billing.push(chalk.hex(colors.accent)(`session cost $${sessionCostUsd.toFixed(4)}`));
++    }
++    const rightCandidates = [
++      [...billing, contextText].join('  '),
++      [billing[0], contextText].filter(Boolean).join('  '),
++      contextText,
++    ];
++    const rightText = rightCandidates.find((candidate) => visibleWidth(candidate) <= width) ??
++      truncateToWidth(rightCandidates.at(-1) ?? '', width, '…');
++    const rightWidth = visibleWidth(rightText);
+     let line2: string;
+     const hint = this.transientHint ?? this.warningHint;
+     if (hint) {
+-      const maxHintWidth = Math.max(0, width - contextWidth - 1);
++      const maxHintWidth = Math.max(0, width - rightWidth - 1);
+       const shownHint =
+         visibleWidth(hint) <= maxHintWidth ? hint : truncateToWidth(hint, maxHintWidth, '…');
+       const hintWidth = visibleWidth(shownHint);
+-      const pad = Math.max(0, width - hintWidth - contextWidth);
++      const pad = Math.max(0, width - hintWidth - rightWidth);
+       line2 =
+-        chalk.hex(colors.warning).bold(shownHint) +
+-        ' '.repeat(pad) +
+-        chalk.hex(colors.text)(contextText);
++        chalk.hex(colors.warning).bold(shownHint) + ' '.repeat(pad) + rightText;
+     } else {
+       // A status_line.command owns line 1 outright, so the ctrl+o hint moves
+       // down here; the transient and warning hints above take precedence.
+       const shortcut = customLine !== null ? this.expandShortcut() : null;
+       const left =
+-        shortcut !== null && visibleWidth(shortcut) + 1 + contextWidth <= width
++        shortcut !== null && visibleWidth(shortcut) + 1 + rightWidth <= width
+           ? chalk.hex(colors.textDim)(shortcut)
+           : '';
+-      const leftPad = Math.max(0, width - visibleWidth(left) - contextWidth);
+-      line2 = left + ' '.repeat(leftPad) + chalk.hex(colors.text)(contextText);
++      const leftPad = Math.max(0, width - visibleWidth(left) - rightWidth);
++      line2 = left + ' '.repeat(leftPad) + rightText;
+     }
+ 
+     return [truncateToWidth(line1, width), truncateToWidth(line2, width)];
+@@ -438,6 +465,7 @@ export class FooterComponent implements Component {
+       tasks: [],
+       cwd: [],
+       git: [],
++      usage: [],
+       tips: [],
+     };
+ 
+@@ -505,6 +533,16 @@ export class FooterComponent implements Component {
+     const git = this.gitCache.getStatus();
+     if (git !== null) slots['git'] = [formatFooterGitBadge(git, colors)];
+ 
++    const { balance, sessionCostUsd } = this.billingStatus(state);
++    const usage: string[] = [];
++    if (sessionCostUsd !== undefined) {
++      usage.push(chalk.hex(colors.textMuted)(`cost: $${sessionCostUsd.toFixed(4)}`));
++    }
++    if (balance !== undefined) {
++      usage.push(chalk.hex(colors.textMuted)(`balance: $${balance.usd.toFixed(2)}`));
++    }
++    slots['usage'] = usage;
++
+     return slots;
+   }
+ 
+@@ -553,6 +591,18 @@ export class FooterComponent implements Component {
+       clearInterval(this.goalTimer);
+       this.goalTimer = null;
+     }
++    this.billing.stop();
++  }
++
++  private billingStatus(state: AppState): {
++    balance: ProviderBalance | undefined;
++    sessionCostUsd: number | undefined;
++  } {
++    const resolve = modelResolver(state.availableModels, state.availableProviders);
++    return {
++      balance: this.billing.balanceFor(resolve(state.model).baseUrl),
++      sessionCostUsd: this.billing.sessionCostUsd(state.sessionUsage, resolve),
++    };
+   }
+ 
+   private goalWallClockMs(goal: AppState['goal']): number | undefined {
+diff --git a/apps/kimi-code/src/tui/controllers/session-event-handler.ts b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+index c227a0c51da1c94321be36ece136096ab1bc44be..b14c7f2ee2fe237b576eb319ba01cf674c5bc687 100644
+--- a/apps/kimi-code/src/tui/controllers/session-event-handler.ts
++++ b/apps/kimi-code/src/tui/controllers/session-event-handler.ts
+@@ -768,6 +768,7 @@ export class SessionEventHandler {
+     if (event.thinkingEffort !== undefined) patch.thinkingEffort = event.thinkingEffort;
+     if (event.usage?.total !== undefined) {
+       patch.cumulativeTokens = sumTokenUsage(event.usage.total);
++      patch.sessionUsage = event.usage;
+     }
+     if (Object.keys(patch).length > 0) this.host.setAppState(patch);
+     if (event.swarmMode === false) {
+diff --git a/apps/kimi-code/src/tui/kimi-tui.ts b/apps/kimi-code/src/tui/kimi-tui.ts
+index 7a9feff8dea2ed9fed874306a6a5e826a4fb6012..748d8a914331f4e3a2c5ea84de398e69cc147b5b 100644
+--- a/apps/kimi-code/src/tui/kimi-tui.ts
++++ b/apps/kimi-code/src/tui/kimi-tui.ts
+@@ -290,6 +290,7 @@ function createInitialAppState(input: KimiTUIStartupInput): AppState {
+     contextTokens: 0,
+     maxContextTokens: 0,
+     cumulativeTokens: 0,
++    sessionUsage: undefined,
+     isCompacting: false,
+     isReplaying: false,
+     streamingPhase: 'idle',
+@@ -2885,6 +2886,11 @@ export class KimiTUI {
+     // would delete the staged media (e.g. a pasted image's daemon upload)
+     // before the engine's intake can read it.
+     if (previous !== undefined) this.staging.releaseAll();
++    this.setAppState({
++      sessionId: session.id,
++      cumulativeTokens: 0,
++      sessionUsage: undefined,
++    });
+     this.session = session;
+     this.surveyController.seedUserTurnCount(initialUserTurnCount);
+     this.harness.setTelemetryContext({ sessionId: session.id });
+@@ -2907,6 +2913,7 @@ export class KimiTUI {
+       contextUsage: status.contextUsage,
+       cumulativeTokens:
+         status.usage?.total === undefined ? 0 : sumTokenUsage(status.usage.total),
++      sessionUsage: status.usage,
+       sessionTitle: session.summary?.title ?? null,
+       goal: goalResult.goal,
+     });
+diff --git a/apps/kimi-code/src/tui/types.ts b/apps/kimi-code/src/tui/types.ts
+index 24347ace863b1db27bcf47b57b16585f75572c3c..66a326257554667e8ee620a44569fa6c50f5a9e2 100644
+--- a/apps/kimi-code/src/tui/types.ts
++++ b/apps/kimi-code/src/tui/types.ts
+@@ -5,6 +5,7 @@ import type {
+   PermissionMode,
+   ProviderConfig,
+   PromptPart,
++  SessionUsage,
+   ThinkingEffort,
+   TokenUsage,
+   ToolInputDisplay,
+@@ -64,6 +65,8 @@ export interface AppState {
+   contextTokens: number;
+   maxContextTokens: number;
+   cumulativeTokens?: number;
++  /** Token usage of the active session, per model; the footer prices it. */
++  sessionUsage?: SessionUsage;
+   isCompacting: boolean;
+   isReplaying: boolean;
+   streamingPhase: 'idle' | 'waiting' | 'thinking' | 'composing' | 'shell';
+diff --git a/apps/kimi-code/src/utils/billing/billing-monitor.ts b/apps/kimi-code/src/utils/billing/billing-monitor.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9206ca1103a9b61ca68986da3c6ddef24558ac8
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/billing-monitor.ts
+@@ -0,0 +1,145 @@
++import type { ModelAlias, ProviderConfig, SessionUsage, TokenUsage } from '@moonshot-ai/kimi-code-sdk';
++
++import { costOfUsage, type BillingProvider, type TokenPrices } from './billing-provider';
++
++export interface ProviderBalance {
++  readonly label: string;
++  readonly usd: number;
++}
++
++export interface ModelEndpoint {
++  readonly baseUrl: string | undefined;
++  readonly model: string;
++}
++
++export type ModelResolver = (modelKey: string) => ModelEndpoint;
++
++/**
++ * Resolves a session-usage key to the endpoint and upstream model id it is billed by.
++ * The engine keys usage by model alias; `<baseUrl>#<model>` keys are understood too.
++ */
++export function modelResolver(
++  models: Readonly<Record<string, Pick<ModelAlias, 'provider' | 'model' | 'baseUrl'>>>,
++  providers: Readonly<Record<string, Pick<ProviderConfig, 'baseUrl'>>>,
++): ModelResolver {
++  return (modelKey) => {
++    const alias = models[modelKey];
++    if (alias !== undefined) {
++      return { baseUrl: alias.baseUrl ?? providers[alias.provider]?.baseUrl, model: alias.model };
++    }
++    const separator = modelKey.lastIndexOf('#');
++    return separator < 0
++      ? { baseUrl: undefined, model: modelKey }
++      : { baseUrl: modelKey.slice(0, separator), model: modelKey.slice(separator + 1) };
++  };
++}
++
++/** What the footer reads from billing. */
++export interface BillingSource {
++  start(): void;
++  stop(): void;
++  balanceFor(baseUrl: string | undefined): ProviderBalance | undefined;
++  sessionCostUsd(usage: SessionUsage | undefined, resolve: ModelResolver): number | undefined;
++}
++
++export interface BillingMonitorOptions {
++  readonly onUpdate?: () => void;
++  readonly balanceIntervalMs?: number;
++  readonly pricesIntervalMs?: number;
++}
++
++/** Polls the balance and price list of every configured provider and prices session usage. */
++export class BillingMonitor implements BillingSource {
++  private readonly balances = new Map<BillingProvider, number>();
++  private readonly prices = new Map<BillingProvider, ReadonlyMap<string, TokenPrices>>();
++  private timers: ReturnType<typeof setInterval>[] = [];
++  private stopped = false;
++
++  constructor(
++    private readonly providers: readonly BillingProvider[],
++    private readonly options: BillingMonitorOptions = {},
++  ) {}
++
++  start(): void {
++    this.stop();
++    if (this.configuredProviders().length === 0) return;
++    this.stopped = false;
++    void this.refresh();
++    this.timers = [
++      setInterval(() => void this.refreshBalances(), this.options.balanceIntervalMs ?? 60_000),
++      setInterval(() => void this.refreshPrices(), this.options.pricesIntervalMs ?? 10 * 60_000),
++    ];
++    for (const timer of this.timers) timer.unref?.();
++  }
++
++  stop(): void {
++    this.stopped = true;
++    for (const timer of this.timers) clearInterval(timer);
++    this.timers = [];
++  }
++
++  async refresh(): Promise<void> {
++    await Promise.all([this.refreshBalances(), this.refreshPrices()]);
++  }
++
++  balanceFor(baseUrl: string | undefined): ProviderBalance | undefined {
++    const provider = this.providerFor(baseUrl);
++    const usd = provider === undefined ? undefined : this.balances.get(provider);
++    return provider === undefined || usd === undefined ? undefined : { label: provider.label, usd };
++  }
++
++  /**
++   * Reported costs plus per-model prices for the rest. Undefined as soon as one model
++   * cannot be priced, so the footer never shows a partial or guessed total.
++   */
++  sessionCostUsd(usage: SessionUsage | undefined, resolve: ModelResolver): number | undefined {
++    const byModel = usage?.byModel;
++    if (byModel === undefined || Object.keys(byModel).length === 0) return usage?.total?.cost;
++    let total = 0;
++    for (const [modelKey, tokens] of Object.entries(byModel)) {
++      const cost = tokens.cost ?? this.priceTokens(resolve(modelKey), tokens);
++      if (cost === undefined) return undefined;
++      total += cost;
++    }
++    return total;
++  }
++
++  private async refreshBalances(): Promise<void> {
++    const results = await Promise.all(
++      this.configuredProviders().map(async (provider) => [provider, await provider.fetchBalanceUsd()] as const),
++    );
++    if (this.stopped) return;
++    for (const [provider, usd] of results) {
++      if (usd === undefined) this.balances.delete(provider);
++      else this.balances.set(provider, usd);
++    }
++    this.options.onUpdate?.();
++  }
++
++  private async refreshPrices(): Promise<void> {
++    const results = await Promise.all(
++      this.configuredProviders().map(async (provider) => [provider, await provider.fetchPrices()] as const),
++    );
++    if (this.stopped) return;
++    for (const [provider, prices] of results) {
++      // A failed refresh returns no prices; keep the last list instead of hiding costs.
++      if (prices.size > 0) this.prices.set(provider, prices);
++    }
++    this.options.onUpdate?.();
++  }
++
++  private priceTokens(endpoint: ModelEndpoint, tokens: TokenUsage): number | undefined {
++    const provider = this.providerFor(endpoint.baseUrl);
++    if (provider === undefined) return undefined;
++    const prices = this.prices.get(provider)?.get(endpoint.model) ?? provider.fallbackPrices();
++    return prices === undefined ? undefined : costOfUsage(tokens, prices);
++  }
++
++  private providerFor(baseUrl: string | undefined): BillingProvider | undefined {
++    return this.providers.find((provider) => provider.bills(baseUrl));
++  }
++
++  private configuredProviders(): BillingProvider[] {
++    return this.providers.filter((provider) => provider.configured);
++  }
++}
+diff --git a/apps/kimi-code/src/utils/billing/billing-provider.ts b/apps/kimi-code/src/utils/billing/billing-provider.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b3f7eca5577b98f1a4f3fbd3a6e39bc4fa7f73b
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/billing-provider.ts
+@@ -0,0 +1,110 @@
++import type { TokenUsage } from '@moonshot-ai/kimi-code-sdk';
++
++export type BillingEnv = Readonly<Record<string, string | undefined>>;
++
++export type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
++
++/** Prices in USD per million tokens. */
++export interface TokenPrices {
++  readonly input: number;
++  readonly output: number;
++  readonly cacheRead: number;
++  readonly cacheWrite: number;
++}
++
++type BillableTokens = Pick<TokenUsage, 'inputOther' | 'output' | 'inputCacheRead' | 'inputCacheCreation'>;
++
++const REQUEST_TIMEOUT_MS = 5_000;
++
++export function costOfUsage(usage: BillableTokens, prices: TokenPrices): number {
++  return (
++    (usage.inputOther * prices.input +
++      usage.output * prices.output +
++      usage.inputCacheRead * prices.cacheRead +
++      usage.inputCacheCreation * prices.cacheWrite) /
++    1_000_000
++  );
++}
++
++/** A finite number from a JSON number or numeric string. */
++export function toFiniteNumber(value: unknown): number | undefined {
++  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
++  if (typeof value !== 'string' || value.trim() === '') return undefined;
++  const parsed = Number(value);
++  return Number.isFinite(parsed) ? parsed : undefined;
++}
++
++export function asRecord(value: unknown): Record<string, unknown> | undefined {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : undefined;
++}
++
++/**
++ * An API provider whose account balance and request costs the footer can show.
++ * Subclasses only describe their endpoints; keys, requests and failures are handled here.
++ */
++export abstract class BillingProvider {
++  /** Name shown in the footer, as in "7api balance $9.18". */
++  abstract readonly label: string;
++  /** API host; models whose base URL points at it are billed by this provider. */
++  protected abstract readonly host: string;
++  /** Environment variable that holds the API key. */
++  protected abstract readonly apiKeyEnv: string;
++
++  constructor(
++    protected readonly env: BillingEnv = process.env,
++    private readonly fetcher: Fetcher = globalThis.fetch,
++  ) {}
++
++  get configured(): boolean {
++    return this.apiKey !== undefined;
++  }
++
++  bills(baseUrl: string | undefined): boolean {
++    if (baseUrl === undefined) return false;
++    try {
++      return new URL(baseUrl).host === this.host;
++    } catch {
++      return false;
++    }
++  }
++
++  /** Current balance in USD, or undefined when it cannot be read. */
++  abstract fetchBalanceUsd(): Promise<number | undefined>;
++
++  /** Published per-model prices. Providers that report each request's cost need none. */
++  async fetchPrices(): Promise<ReadonlyMap<string, TokenPrices>> {
++    return new Map();
++  }
++
++  /** Prices for models missing from fetchPrices(), such as user-configured rates. */
++  fallbackPrices(): TokenPrices | undefined {
++    return undefined;
++  }
++
++  protected get apiKey(): string | undefined {
++    return this.envValue(this.apiKeyEnv);
++  }
++
++  /** A trimmed environment variable; empty counts as unset. */
++  protected envValue(name: string): string | undefined {
++    const value = this.env[name]?.trim();
++    return value === undefined || value === '' ? undefined : value;
++  }
++
++  /** GETs a JSON document with the API key; resolves undefined on any failure. */
++  protected async getJson(url: string): Promise<unknown> {
++    const key = this.apiKey;
++    if (key === undefined) return undefined;
++    try {
++      const response = await this.fetcher(url, {
++        headers: { Authorization: `Bearer ${key}` },
++        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
++      });
++      return response.ok ? await response.json() : undefined;
++    } catch {
++      return undefined;
++    }
++  }
++}
+diff --git a/apps/kimi-code/src/utils/billing/closedrouter.ts b/apps/kimi-code/src/utils/billing/closedrouter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..44ff0b8898bbb0cb1f13f868da738f55f6763911
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/closedrouter.ts
+@@ -0,0 +1,43 @@
++import { asRecord, BillingProvider, toFiniteNumber, type TokenPrices } from './billing-provider';
++
++const DEFAULT_BALANCE_URL = 'https://api.closerouter.dev/v1/credits';
++const BALANCE_KEYS = ['total_credits', 'balance', 'remaining', 'remaining_usd', 'credits'];
++
++/** ClosedRouter reports each request's cost in `usage.cost`, so it needs no price list. */
++export class ClosedRouterBilling extends BillingProvider {
++  readonly label = 'ClosedRouter';
++  protected readonly host = 'api.closerouter.dev';
++  protected readonly apiKeyEnv = 'CLOSEROUTER_API_KEY';
++
++  async fetchBalanceUsd(): Promise<number | undefined> {
++    const url = this.envValue('CLOSEROUTER_BALANCE_URL') ?? DEFAULT_BALANCE_URL;
++    return findBalance(await this.getJson(url));
++  }
++
++  /** The optional CLOSEROUTER_*_USD_PER_MILLION rates, used only when all four are set. */
++  override fallbackPrices(): TokenPrices | undefined {
++    const input = rate(this.env['CLOSEROUTER_INPUT_USD_PER_MILLION']);
++    const output = rate(this.env['CLOSEROUTER_OUTPUT_USD_PER_MILLION']);
++    const cacheRead = rate(this.env['CLOSEROUTER_CACHE_READ_USD_PER_MILLION']);
++    const cacheWrite = rate(this.env['CLOSEROUTER_CACHE_WRITE_USD_PER_MILLION']);
++    if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) {
++      return undefined;
++    }
++    return { input, output, cacheRead, cacheWrite };
++  }
++}
++
++function rate(value: string | undefined): number | undefined {
++  const parsed = toFiniteNumber(value);
++  return parsed !== undefined && parsed >= 0 ? parsed : undefined;
++}
++
++function findBalance(value: unknown): number | undefined {
++  const record = asRecord(value);
++  if (record === undefined) return toFiniteNumber(value);
++  for (const key of BALANCE_KEYS) {
++    const balance = toFiniteNumber(record[key]);
++    if (balance !== undefined) return balance;
++  }
++  return findBalance(record['data']);
++}
+diff --git a/apps/kimi-code/src/utils/billing/providers.ts b/apps/kimi-code/src/utils/billing/providers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..91c1d1c8d68de5342b8020f7132442aaf06a7c41
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/providers.ts
+@@ -0,0 +1,8 @@
++import type { BillingEnv, BillingProvider, Fetcher } from './billing-provider';
++import { ClosedRouterBilling } from './closedrouter';
++import { SevenApiBilling } from './sevenapi';
++
++/** Every provider whose balance and costs the footer can show. Register new providers here. */
++export function createBillingProviders(env?: BillingEnv, fetcher?: Fetcher): BillingProvider[] {
++  return [new ClosedRouterBilling(env, fetcher), new SevenApiBilling(env, fetcher)];
++}
+diff --git a/apps/kimi-code/src/utils/billing/sevenapi.ts b/apps/kimi-code/src/utils/billing/sevenapi.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..15eb8e3c12c0cdc593b68b431019174524855cc1
+--- /dev/null
++++ b/apps/kimi-code/src/utils/billing/sevenapi.ts
+@@ -0,0 +1,30 @@
++import { asRecord, BillingProvider, toFiniteNumber, type TokenPrices } from './billing-provider';
++
++const API_BASE = 'https://7api.st/v1';
++
++/** 7api publishes a price per model; its replies carry token counts but no cost. */
++export class SevenApiBilling extends BillingProvider {
++  readonly label = '7api';
++  protected readonly host = '7api.st';
++  protected readonly apiKeyEnv = 'SEVENAPI_API_KEY';
++
++  async fetchBalanceUsd(): Promise<number | undefined> {
++    return toFiniteNumber(asRecord(await this.getJson(`${API_BASE}/balance`))?.['balance_usd']);
++  }
++
++  override async fetchPrices(): Promise<ReadonlyMap<string, TokenPrices>> {
++    const models = asRecord(await this.getJson(`${API_BASE}/models`))?.['data'];
++    const prices = new Map<string, TokenPrices>();
++    for (const model of Array.isArray(models) ? models : []) {
++      const entry = asRecord(model);
++      const pricing = asRecord(entry?.['pricing']);
++      const perMillion = toFiniteNumber(pricing?.['price_usd_per_mtok']);
++      const cacheRead = toFiniteNumber(pricing?.['cache_read_usd_per_mtok']);
++      const id = entry?.['id'];
++      if (typeof id !== 'string' || perMillion === undefined || cacheRead === undefined) continue;
++      // 7api bills input, output and cache writes at one rate and cache reads at another.
++      prices.set(id, { input: perMillion, output: perMillion, cacheWrite: perMillion, cacheRead });
++    }
++    return prices;
++  }
++}
+diff --git a/apps/kimi-code/test/tui/components/chrome/footer.test.ts b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+index a5506500d8acf6911025a38e6dfe4f3791152474..e8636c52e52c509a18e22625fdc5ef2e393baa67 100644
+--- a/apps/kimi-code/test/tui/components/chrome/footer.test.ts
++++ b/apps/kimi-code/test/tui/components/chrome/footer.test.ts
+@@ -6,6 +6,8 @@ import { setRainbowDance, type RainbowDanceController } from '#/tui/easter-eggs/
+ import { currentTheme, darkColors, lightColors } from '#/tui/theme';
+ import type { ModelAlias } from '@moonshot-ai/kimi-code-sdk';
+ import type { AppState } from '#/tui/types';
++import { BillingMonitor, type BillingSource, type ProviderBalance } from '#/utils/billing/billing-monitor';
++import { SevenApiBilling } from '#/utils/billing/sevenapi';
+ 
+ const gitStatusMocks = vi.hoisted(() => ({
+   createGitStatusCache: vi.fn(),
+@@ -179,6 +181,104 @@ describe('FooterComponent', () => {
+     expect(rendered).not.toContain('thinking:high');
+   });
+ 
++  describe('provider billing', () => {
++    const sevenApiState: AppState = {
++      ...appState,
++      model: '7api/gpt-6-astra',
++      availableModels: {
++        '7api/gpt-6-astra': { provider: '7api-responses', model: 'gpt-6-astra', maxContextSize: 1_050_000 },
++      },
++      availableProviders: {
++        '7api-responses': { type: 'openai_responses', baseUrl: 'https://7api.st/v1' },
++      },
++    };
++    const fakeBilling = (
++      balances: Record<string, ProviderBalance>,
++      sessionCost?: number,
++    ): BillingSource => ({
++      start: () => {},
++      stop: () => {},
++      balanceFor: (baseUrl) => (baseUrl === undefined ? undefined : balances[baseUrl]),
++      sessionCostUsd: () => sessionCost,
++    });
++    const plain = (footer: FooterComponent) =>
++      footer.render(160).join('\n').replaceAll(/\u001B\[[0-9;]*m/g, '');
++
++    it('shows the balance of the provider billing the active model and the session cost', () => {
++      const billing = fakeBilling({ 'https://7api.st/v1': { label: '7api', usd: 9.18 } }, 1.2345);
++      const footer = new FooterComponent(sevenApiState, () => {}, billing);
++      const rendered = plain(footer);
++      expect(rendered).toContain('7api balance $9.18');
++      expect(rendered).toContain('session cost $1.2345');
++      footer.dispose();
++    });
++
++    it("prefers the model's own base URL over its provider's", () => {
++      const state: AppState = {
++        ...sevenApiState,
++        availableModels: {
++          '7api/gpt-6-astra': {
++            provider: '7api-responses',
++            model: 'gpt-6-astra',
++            maxContextSize: 1_050_000,
++            baseUrl: 'https://api.closerouter.dev/v1',
++          },
++        },
++      };
++      const billing = fakeBilling({
++        'https://api.closerouter.dev/v1': { label: 'ClosedRouter', usd: 18.2 },
++        'https://7api.st/v1': { label: '7api', usd: 9.18 },
++      });
++      const footer = new FooterComponent(state, () => {}, billing);
++      expect(plain(footer)).toContain('ClosedRouter balance $18.20');
++      expect(plain(footer)).not.toContain('7api balance');
++      footer.dispose();
++    });
++
++    it('shows no balance or cost when billing has none', () => {
++      const footer = new FooterComponent(sevenApiState, () => {}, fakeBilling({}));
++      const rendered = plain(footer);
++      expect(rendered).not.toContain('balance $');
++      expect(rendered).not.toContain('session cost');
++      footer.dispose();
++    });
++
++    it('prices alias-keyed session usage end to end', async () => {
++      const responses: Record<string, unknown> = {
++        'https://7api.st/v1/balance': { balance_usd: 9.18 },
++        'https://7api.st/v1/models': {
++          data: [{ id: 'gpt-6-astra', pricing: { price_usd_per_mtok: 0.45, cache_read_usd_per_mtok: 0.04 } }],
++        },
++      };
++      const fetcher = async (input: string | URL | Request): Promise<Response> => {
++        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++        return new Response(JSON.stringify(responses[url]), { status: 200 });
++      };
++      const monitor = new BillingMonitor([new SevenApiBilling({ SEVENAPI_API_KEY: 'sk-test' }, fetcher)]);
++      await monitor.refresh();
++      const turn = { inputOther: 699, output: 76, inputCacheRead: 23_040, inputCacheCreation: 0 };
++      const state: AppState = {
++        ...sevenApiState,
++        sessionUsage: { total: turn, byModel: { '7api/gpt-6-astra': turn } },
++      };
++      const footer = new FooterComponent(state, () => {}, monitor);
++      const rendered = plain(footer);
++      expect(rendered).toContain('7api balance $9.18');
++      expect(rendered).toContain('session cost $0.0013');
++      footer.dispose();
++    });
++
++    it('starts billing with the footer and stops it on dispose', () => {
++      const billing = fakeBilling({});
++      const start = vi.spyOn(billing, 'start');
++      const stop = vi.spyOn(billing, 'stop');
++      const footer = new FooterComponent(appState, () => {}, billing);
++      expect(start).toHaveBeenCalledTimes(1);
++      footer.dispose();
++      expect(stop).toHaveBeenCalledTimes(1);
++    });
++  });
++
+   it('shows the tower mode chip only when tower mode is on', () => {
+     const on = new FooterComponent({ ...appState, towerMode: true });
+     expect(on.render(120).join('\n')).toContain('tower');
+diff --git a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+index 75f3146c10571076065fe582f46f2af6908df320..1eb522ea1dbfa2aa0db80fd05a4bbc6702904932 100644
+--- a/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
++++ b/apps/kimi-code/test/tui/controllers/session-event-handler-compaction.test.ts
+@@ -80,6 +80,20 @@ const compactionCancelled = {
+   agentId: 'main',
+ } as const;
+ 
++describe('SessionEventHandler session usage', () => {
++  it('keeps the per-model session usage for footer billing', () => {
++    const { host } = makeHost();
++    const handler = new SessionEventHandler(host);
++    const tokens = { inputOther: 1_000, output: 20, inputCacheRead: 0, inputCacheCreation: 0 };
++    const usage = { total: tokens, byModel: { 'https://7api.st/v1#gpt-6-astra': tokens } };
++    handler.handleEvent(
++      { type: 'agent.status.updated', sessionId: 's1', agentId: 'main', usage } as any,
++      () => {},
++    );
++    expect(host.state.appState.sessionUsage).toEqual(usage);
++  });
++});
++
+ describe('SessionEventHandler compaction cache bookkeeping', () => {
+   it('records activity and resets the cache-break baseline after a completed compaction', () => {
+     const { host } = makeHost();
+diff --git a/apps/kimi-code/test/utils/billing/billing-monitor.test.ts b/apps/kimi-code/test/utils/billing/billing-monitor.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..42059a2e8b635a53211ca27143d65597d870b061
+--- /dev/null
++++ b/apps/kimi-code/test/utils/billing/billing-monitor.test.ts
+@@ -0,0 +1,176 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import type { TokenUsage } from '@moonshot-ai/kimi-code-sdk';
++
++import { BillingMonitor, modelResolver } from '#/utils/billing/billing-monitor';
++import { BillingProvider, type TokenPrices } from '#/utils/billing/billing-provider';
++
++class FakeProvider extends BillingProvider {
++  readonly label: string;
++  protected readonly host: string;
++  protected readonly apiKeyEnv = 'FAKE_API_KEY';
++  balanceRequests = 0;
++
++  constructor(
++    label: string,
++    host: string,
++    private readonly balance: number | undefined,
++    private readonly prices: Record<string, TokenPrices> = {},
++    configured = true,
++  ) {
++    super(configured ? { FAKE_API_KEY: 'key' } : {});
++    this.label = label;
++    this.host = host;
++  }
++
++  async fetchBalanceUsd(): Promise<number | undefined> {
++    this.balanceRequests += 1;
++    return this.balance;
++  }
++
++  override async fetchPrices(): Promise<ReadonlyMap<string, TokenPrices>> {
++    return new Map(Object.entries(this.prices));
++  }
++}
++
++const astraPrices = { input: 0.45, output: 0.45, cacheWrite: 0.45, cacheRead: 0.04 };
++const closedRouter = () => new FakeProvider('ClosedRouter', 'api.closerouter.dev', 18.2);
++const sevenApi = () => new FakeProvider('7api', '7api.st', 9.18, { 'gpt-6-astra': astraPrices });
++const tokens = (usage: Partial<TokenUsage>): TokenUsage => ({
++  inputOther: 0,
++  output: 0,
++  inputCacheRead: 0,
++  inputCacheCreation: 0,
++  ...usage,
++});
++const byUrlKey = modelResolver({}, {});
++
++describe('modelResolver', () => {
++  const resolve = modelResolver(
++    {
++      '7api/gpt-6-astra': { provider: '7api-responses', model: 'gpt-6-astra' },
++      'own/endpoint': { provider: '7api-responses', model: 'm', baseUrl: 'https://own.test/v1' },
++    },
++    { '7api-responses': { baseUrl: 'https://7api.st/v1' } },
++  );
++
++  it("resolves a model alias to its provider's base URL and upstream model id", () => {
++    expect(resolve('7api/gpt-6-astra')).toEqual({ baseUrl: 'https://7api.st/v1', model: 'gpt-6-astra' });
++  });
++
++  it("prefers the alias's own base URL", () => {
++    expect(resolve('own/endpoint')).toEqual({ baseUrl: 'https://own.test/v1', model: 'm' });
++  });
++
++  it('parses `<baseUrl>#<model>` keys and leaves unknown bare keys without an endpoint', () => {
++    expect(resolve('https://7api.st#claude-haiku-5-5')).toEqual({ baseUrl: 'https://7api.st', model: 'claude-haiku-5-5' });
++    expect(resolve('unknown-model')).toEqual({ baseUrl: undefined, model: 'unknown-model' });
++  });
++});
++
++describe('BillingMonitor', () => {
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it('shows the balance of the provider that bills a model endpoint', async () => {
++    const monitor = new BillingMonitor([closedRouter(), sevenApi()]);
++    await monitor.refresh();
++    expect(monitor.balanceFor('https://7api.st/v1')).toEqual({ label: '7api', usd: 9.18 });
++    expect(monitor.balanceFor('https://api.closerouter.dev/v1')).toEqual({ label: 'ClosedRouter', usd: 18.2 });
++    expect(monitor.balanceFor('https://example.com/v1')).toBeUndefined();
++    expect(monitor.balanceFor(undefined)).toBeUndefined();
++  });
++
++  it('only contacts providers that have an API key', async () => {
++    const unconfigured = new FakeProvider('7api', '7api.st', 9.18, {}, false);
++    const monitor = new BillingMonitor([unconfigured]);
++    await monitor.refresh();
++    expect(unconfigured.balanceRequests).toBe(0);
++    expect(monitor.balanceFor('https://7api.st/v1')).toBeUndefined();
++  });
++
++  it('adds reported costs and prices the remaining models with their own rates', async () => {
++    const monitor = new BillingMonitor([closedRouter(), sevenApi()]);
++    await monitor.refresh();
++    const cost = monitor.sessionCostUsd(
++      {
++        byModel: {
++          'https://api.closerouter.dev/v1#openai/gpt-6-astra': tokens({ inputOther: 1000, cost: 0.01 }),
++          'https://7api.st/v1#gpt-6-astra': tokens({
++            inputOther: 1_000_000,
++            output: 1_000_000,
++            inputCacheRead: 1_000_000,
++          }),
++        },
++      },
++      byUrlKey,
++    );
++    expect(cost).toBeCloseTo(0.01 + 0.45 + 0.45 + 0.04, 10);
++  });
++
++  it('prices usage keyed by model alias, as the engine records it', async () => {
++    const monitor = new BillingMonitor([sevenApi()]);
++    await monitor.refresh();
++    const resolve = modelResolver(
++      { '7api/gpt-6-astra': { provider: '7api-responses', model: 'gpt-6-astra' } },
++      { '7api-responses': { baseUrl: 'https://7api.st/v1' } },
++    );
++    // A real turn: 699 input + 76 output tokens at $0.45/M, 23,040 cached at $0.04/M.
++    const usage = { byModel: { '7api/gpt-6-astra': tokens({ inputOther: 699, output: 76, inputCacheRead: 23_040 }) } };
++    expect(monitor.sessionCostUsd(usage, resolve)).toBeCloseTo(0.00127035, 12);
++  });
++
++  it("uses a provider's fallback prices for models missing from its price list", async () => {
++    class RatedProvider extends FakeProvider {
++      override fallbackPrices(): TokenPrices {
++        return { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 };
++      }
++    }
++    const monitor = new BillingMonitor([new RatedProvider('ClosedRouter', 'api.closerouter.dev', 1)]);
++    await monitor.refresh();
++    const usage = { byModel: { 'https://api.closerouter.dev/v1#openai/x': tokens({ output: 1_000_000 }) } };
++    expect(monitor.sessionCostUsd(usage, byUrlKey)).toBe(1);
++  });
++
++  it('hides the session cost when any model cannot be priced', async () => {
++    const monitor = new BillingMonitor([sevenApi()]);
++    await monitor.refresh();
++    const unknownModel = { byModel: { 'https://7api.st/v1#unknown-model': tokens({ output: 10 }) } };
++    const unknownProvider = { byModel: { 'https://other.example/v1#model': tokens({ output: 10 }) } };
++    const unresolvedAlias = { byModel: { 'some/alias': tokens({ output: 10 }) } };
++    expect(monitor.sessionCostUsd(unknownModel, byUrlKey)).toBeUndefined();
++    expect(monitor.sessionCostUsd(unknownProvider, byUrlKey)).toBeUndefined();
++    expect(monitor.sessionCostUsd(unresolvedAlias, byUrlKey)).toBeUndefined();
++  });
++
++  it('falls back to the reported session total without a per-model breakdown', () => {
++    const monitor = new BillingMonitor([]);
++    expect(monitor.sessionCostUsd({ total: tokens({ cost: 0.5 }) }, byUrlKey)).toBe(0.5);
++    expect(monitor.sessionCostUsd({ total: tokens({ output: 5 }) }, byUrlKey)).toBeUndefined();
++    expect(monitor.sessionCostUsd(undefined, byUrlKey)).toBeUndefined();
++  });
++
++  it('polls every interval after start, notifies on updates, and stops cleanly', async () => {
++    vi.useFakeTimers();
++    const provider = sevenApi();
++    const onUpdate = vi.fn();
++    const monitor = new BillingMonitor([provider], { onUpdate, balanceIntervalMs: 60_000 });
++    monitor.start();
++    await vi.advanceTimersByTimeAsync(0);
++    expect(provider.balanceRequests).toBe(1);
++    expect(onUpdate).toHaveBeenCalled();
++    await vi.advanceTimersByTimeAsync(60_000);
++    expect(provider.balanceRequests).toBe(2);
++    monitor.stop();
++    await vi.advanceTimersByTimeAsync(180_000);
++    expect(provider.balanceRequests).toBe(2);
++  });
++
++  it('does not start polling when no provider has an API key', () => {
++    vi.useFakeTimers();
++    const monitor = new BillingMonitor([new FakeProvider('7api', '7api.st', 1, {}, false)]);
++    monitor.start();
++    expect(vi.getTimerCount()).toBe(0);
++    monitor.stop();
++  });
++});
+diff --git a/apps/kimi-code/test/utils/billing/billing-providers.test.ts b/apps/kimi-code/test/utils/billing/billing-providers.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae32d190517f2cdff9ecc6df34f883c3a818f309
+--- /dev/null
++++ b/apps/kimi-code/test/utils/billing/billing-providers.test.ts
+@@ -0,0 +1,137 @@
++import { describe, expect, it } from 'vitest';
++
++import { costOfUsage } from '#/utils/billing/billing-provider';
++import { ClosedRouterBilling } from '#/utils/billing/closedrouter';
++import { createBillingProviders } from '#/utils/billing/providers';
++import { SevenApiBilling } from '#/utils/billing/sevenapi';
++
++interface Call {
++  url: string;
++  authorization: string | null;
++}
++
++function fakeFetch(body: unknown, status = 200) {
++  const calls: Call[] = [];
++  const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
++    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
++    calls.push({ url, authorization: new Headers(init?.headers).get('authorization') });
++    return new Response(JSON.stringify(body), { status });
++  };
++  return { fetcher, calls };
++}
++
++describe('createBillingProviders', () => {
++  it('registers ClosedRouter and 7api', () => {
++    expect(createBillingProviders({}).map((provider) => provider.label)).toEqual(['ClosedRouter', '7api']);
++  });
++});
++
++describe('costOfUsage', () => {
++  it('prices each kind of token at its own per-million rate', () => {
++    expect(
++      costOfUsage(
++        { inputOther: 1_000_000, output: 2_000_000, inputCacheRead: 3_000_000, inputCacheCreation: 4_000_000 },
++        { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
++      ),
++    ).toBe(30);
++  });
++});
++
++describe('ClosedRouterBilling', () => {
++  const env = { CLOSEROUTER_API_KEY: 'secret-token' };
++
++  it('reads the balance from the documented credits endpoint with the API key', async () => {
++    const { fetcher, calls } = fakeFetch({ data: { total_credits: 12.34, total_usage: 5.67 } });
++    await expect(new ClosedRouterBilling(env, fetcher).fetchBalanceUsd()).resolves.toBe(12.34);
++    expect(calls).toEqual([
++      { url: 'https://api.closerouter.dev/v1/credits', authorization: 'Bearer secret-token' },
++    ]);
++  });
++
++  it('supports a custom balance URL and nested compatibility responses', async () => {
++    const { fetcher, calls } = fakeFetch({ data: { balance: '12.34' } });
++    const billing = new ClosedRouterBilling(
++      { ...env, CLOSEROUTER_BALANCE_URL: 'https://example.test/balance' },
++      fetcher,
++    );
++    await expect(billing.fetchBalanceUsd()).resolves.toBe(12.34);
++    expect(calls[0]?.url).toBe('https://example.test/balance');
++  });
++
++  it('reports no balance without a key, on HTTP errors, or when the request fails', async () => {
++    const { fetcher, calls } = fakeFetch({ data: { total_credits: 1 } });
++    await expect(new ClosedRouterBilling({}, fetcher).fetchBalanceUsd()).resolves.toBeUndefined();
++    expect(calls).toHaveLength(0);
++    const serverError = fakeFetch({}, 500).fetcher;
++    await expect(new ClosedRouterBilling(env, serverError).fetchBalanceUsd()).resolves.toBeUndefined();
++    const offline = async (): Promise<Response> => {
++      throw new Error('offline');
++    };
++    await expect(new ClosedRouterBilling(env, offline).fetchBalanceUsd()).resolves.toBeUndefined();
++  });
++
++  it('uses the configured per-million rates as fallback prices only when all four are valid', () => {
++    const rates = {
++      CLOSEROUTER_INPUT_USD_PER_MILLION: '1',
++      CLOSEROUTER_OUTPUT_USD_PER_MILLION: '2',
++      CLOSEROUTER_CACHE_READ_USD_PER_MILLION: '3',
++      CLOSEROUTER_CACHE_WRITE_USD_PER_MILLION: '4',
++    };
++    expect(new ClosedRouterBilling(rates).fallbackPrices()).toEqual({
++      input: 1,
++      output: 2,
++      cacheRead: 3,
++      cacheWrite: 4,
++    });
++    const invalid = { ...rates, CLOSEROUTER_OUTPUT_USD_PER_MILLION: 'abc' };
++    expect(new ClosedRouterBilling(invalid).fallbackPrices()).toBeUndefined();
++    expect(new ClosedRouterBilling({}).fallbackPrices()).toBeUndefined();
++  });
++
++  it('bills only models served from its own API host', () => {
++    const billing = new ClosedRouterBilling(env);
++    expect(billing.bills('https://api.closerouter.dev/v1')).toBe(true);
++    expect(billing.bills('https://api.closerouter.dev')).toBe(true);
++    expect(billing.bills('https://7api.st/v1')).toBe(false);
++    expect(billing.bills('not a url')).toBe(false);
++    expect(billing.bills(undefined)).toBe(false);
++  });
++});
++
++describe('SevenApiBilling', () => {
++  const env = { SEVENAPI_API_KEY: 'sk-test' };
++
++  it('reads the USD balance from /v1/balance with the API key', async () => {
++    const { fetcher, calls } = fakeFetch({ object: 'balance', currency: 'USD', balance_usd: 9.2632 });
++    await expect(new SevenApiBilling(env, fetcher).fetchBalanceUsd()).resolves.toBe(9.2632);
++    expect(calls).toEqual([{ url: 'https://7api.st/v1/balance', authorization: 'Bearer sk-test' }]);
++  });
++
++  it('turns the published model pricing into token prices', async () => {
++    const { fetcher, calls } = fakeFetch({
++      data: [
++        { id: 'gpt-6-astra', pricing: { price_usd_per_mtok: 0.45, cache_read_usd_per_mtok: 0.04 } },
++        { id: 'unpriced-model' },
++      ],
++    });
++    const prices = await new SevenApiBilling(env, fetcher).fetchPrices();
++    expect(calls[0]?.url).toBe('https://7api.st/v1/models');
++    expect([...prices]).toEqual([
++      ['gpt-6-astra', { input: 0.45, output: 0.45, cacheWrite: 0.45, cacheRead: 0.04 }],
++    ]);
++  });
++
++  it('matches what 7api actually charged for a Claude request', () => {
++    // 4 input + 2,363 cache-write + 60 output tokens on claude-haiku-5-5 were billed $0.00007281.
++    const haiku = { input: 0.03, output: 0.03, cacheWrite: 0.03, cacheRead: 0.01 };
++    const usage = { inputOther: 4, inputCacheCreation: 2363, inputCacheRead: 0, output: 60 };
++    expect(costOfUsage(usage, haiku)).toBeCloseTo(0.00007281, 12);
++  });
++
++  it('bills models on both its OpenAI and Anthropic endpoints', () => {
++    const billing = new SevenApiBilling(env);
++    expect(billing.bills('https://7api.st/v1')).toBe(true);
++    expect(billing.bills('https://7api.st')).toBe(true);
++    expect(billing.bills('https://api.closerouter.dev/v1')).toBe(false);
++  });
++});
+-- 
+2.50.1 (Apple Git-155)
+
